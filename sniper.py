@@ -3,7 +3,8 @@
 
 Usage:
   python sniper.py login                      # one time: log in by hand, session is saved
-  python sniper.py run --start 2026-10-10 --end 2026-10-31 [options]
+  python sniper.py run                        # upcoming Wednesdays and Fridays, next 4 weeks
+  python sniper.py run --time 6am             # only slots that start at 6:00 AM
 
 The script only ADDS TO CART. It never checks out or pays.
 """
@@ -97,6 +98,28 @@ def open_context(p, headless):
     return p.chromium.launch_persistent_context(
         str(PROFILE_DIR), headless=headless, viewport={"width": 1280, "height": 1000}
     )
+
+
+TIME_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*([ap])\.?(?:m\.?)?(?![a-z])", re.I)
+
+
+def parse_time(text):
+    m = TIME_RE.fullmatch(text.strip())
+    if not m:
+        raise argparse.ArgumentTypeError(f"can't read time {text!r}; use e.g. 6am or 6:00am")
+    return to_time(m)
+
+
+def to_time(m):
+    hour = int(m.group(1)) % 12 + (12 if m.group(3).lower() == "p" else 0)
+    return dt.time(hour, int(m.group(2) or 0))
+
+
+def start_time(card_text, title):
+    """The first time printed on the card (after the title), i.e. when the slot starts."""
+    rest = card_text.split(title, 1)[-1]
+    m = TIME_RE.search(rest) or TIME_RE.search(card_text)
+    return to_time(m) if m else None
 
 
 def cmd_login(_args):
@@ -194,6 +217,12 @@ def scan_day(page, day, args, secured):
             dump(f"{day}-card", card.evaluate("e => e.outerHTML"))
         if key in secured:
             continue
+        if args.time:
+            begins = start_time(text, args.title)
+            if begins != args.time:
+                if args.verbose:
+                    log(f"  skipping, starts at {begins or 'unknown time'}: {text[:100]}")
+                continue
         if UNAVAILABLE_RE.search(text):
             if args.verbose:
                 log(f"  unavailable: {text[:100]}")
@@ -259,17 +288,24 @@ def open_checkout(ctx, page, cart_tab):
     return cart_tab
 
 
+def upcoming_days(args, weekdays):
+    """Dates to check right now. Recomputed every round so the window rolls forward on its own."""
+    today = dt.date.today()
+    start = max(today, dt.date.fromisoformat(args.start)) if args.start else today
+    end = dt.date.fromisoformat(args.end) if args.end else today + dt.timedelta(weeks=args.weeks)
+    return list(daterange(start, end, weekdays))
+
+
 def cmd_run(args):
-    start = dt.date.fromisoformat(args.start)
-    end = dt.date.fromisoformat(args.end)
-    if end < start:
-        sys.exit("--end must be on or after --start")
+    weekdays = parse_weekdays(args.days)
     secured = load_state()
-    days = list(daterange(start, end, parse_weekdays(args.days)))
+    days = upcoming_days(args, weekdays)
     if not days:
-        sys.exit(f"No {args.days} dates between {start} and {end}")
-    log(f"Watching {len(days)} day(s) ({', '.join(f'{d:%a %b %d}' for d in days)}) for '{args.title}' every ~{args.interval}s"
-        + (" (DRY RUN)" if args.dry_run else ""))
+        sys.exit(f"No upcoming {args.days} dates to check")
+    log(f"Watching {args.days} for '{args.title}'"
+        + (f" starting at {args.time:%-I:%M %p}" if args.time else "")
+        + f", every ~{args.interval}s" + (" (DRY RUN)" if args.dry_run else ""))
+    log(f"Dates: {', '.join(f'{d:%a %b %d}' for d in days)}")
 
     with sync_playwright() as p:
         ctx = open_context(p, headless=args.headless)
@@ -279,6 +315,13 @@ def cmd_run(args):
         try:
             while True:
                 rounds += 1
+                new_days = upcoming_days(args, weekdays)
+                if not new_days:
+                    log("No dates left to check.")
+                    break
+                if new_days != days:
+                    days = new_days
+                    log(f"Dates: {', '.join(f'{d:%a %b %d}' for d in days)}")
                 for day in days:
                     try:
                         if scan_day(page, day, args, secured):
@@ -312,8 +355,10 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("login", help="open a browser so you can log in once")
     r = sub.add_parser("run", help="poll and add matching slots to the cart")
-    r.add_argument("--start", required=True, help="first date, YYYY-MM-DD")
-    r.add_argument("--end", required=True, help="last date, YYYY-MM-DD")
+    r.add_argument("--weeks", type=int, default=4, help="how many weeks ahead to check (default 4)")
+    r.add_argument("--time", type=parse_time, help="only add slots starting at this time, e.g. 6am or 6:00am")
+    r.add_argument("--start", help="optional first date, YYYY-MM-DD (default: today)")
+    r.add_argument("--end", help="optional last date, YYYY-MM-DD (default: --weeks ahead)")
     r.add_argument("--days", default="wed,fri", help="weekdays to check (default: wed,fri)")
     r.add_argument("--title", default=DEFAULT_TITLE, help=f"event title to match (default: {DEFAULT_TITLE!r})")
     r.add_argument("--participant", help="name to tick if the site asks who is registering")

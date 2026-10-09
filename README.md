@@ -16,14 +16,20 @@ Your login is kept in `.browser-profile/` (git-ignored). Don't share that folder
 ## Run
 
 ```bash
-# Try it first without clicking anything:
-python sniper.py run --start 2026-10-10 --end 2026-10-31 --dry-run --once -v
+# Upcoming Wednesdays and Fridays, 4 weeks ahead (the window rolls forward by itself):
+python sniper.py run
 
-# For real:
-python sniper.py run --start 2026-10-10 --end 2026-10-31 --participant "Cassidy"
+# Only slots that start at 6:00 AM:
+python sniper.py run --time 6am
+
+# Try it without clicking anything:
+python sniper.py run --dry-run --once -v
 ```
 
 Options:
+- `--time 6am` only adds slots starting at that time.
+- `--days wed,fri` sets which weekdays to check (default Wednesday and Friday).
+- `--weeks 4` sets how far ahead to look; `--start`/`--end` pin exact dates instead.
 - `--interval 30` sets the seconds between polling rounds (a random 0–30% is added).
 - `--participant NAME` is the name to tick if the site asks who is registering.
 - `--title "..."` matches a different event title.
