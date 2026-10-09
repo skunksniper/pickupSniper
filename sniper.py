@@ -414,39 +414,77 @@ SELECT_REGISTRANTS_RE = re.compile(r"select\s+registrants?", re.I)
 NEXT_REGISTRANT_RE = re.compile(r"next\s+registrant", re.I)
 
 
-def find_button(tab, name_re):
-    for el in tab.get_by_role("button", name=name_re).all() + tab.get_by_role("link", name=name_re).all():
+# Sites often grey a button out with aria-disabled or a "disabled" class instead of real disabling.
+NOT_GREYED_OUT_JS = """e => !e.closest('[disabled], [aria-disabled="true"], .disabled, .is-disabled')"""
+
+
+def find_button(tab, name_re, timeout=0):
+    """A visible, clickable element labelled name_re (button, link, or anything else), waiting up to timeout s."""
+    deadline = time.time() + timeout
+    while True:
+        candidates = (tab.get_by_role("button", name=name_re).all() + tab.get_by_role("link", name=name_re).all()
+                      + tab.get_by_text(name_re).all())
+        for el in candidates:
+            try:
+                if el.is_visible() and el.is_enabled() and el.evaluate(NOT_GREYED_OUT_JS):
+                    return el
+            except Exception:
+                continue
+        if time.time() >= deadline:
+            return None
+        tab.wait_for_timeout(500)
+
+
+def wait_for_change(tab, before, timeout=15):
+    """Wait until the page text differs from `before` (the click took us to the next page)."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        tab.wait_for_timeout(500)
         try:
-            if el.is_visible() and el.is_enabled():
-                return el
+            if tab.inner_text("body") != before:
+                tab.wait_for_timeout(1000)  # let the rest of the new page render
+                return True
         except Exception:
-            continue
-    return None
+            pass  # mid-navigation
+    return False
 
 
-def wait_settled(tab):
-    try:
-        tab.wait_for_load_state("networkidle", timeout=10000)
-    except PWTimeout:
-        pass
-    tab.wait_for_timeout(1000)
+def newest_tab(ctx, tab, pages_before):
+    """If the click opened a new tab, carry on in that one."""
+    new = [p for p in ctx.pages if p not in pages_before and not p.is_closed()]
+    if new:
+        new[-1].wait_for_load_state("domcontentloaded")
+        return new[-1]
+    return tab
 
 
-def click_next_registrants(tab):
-    """DaySmart asks about each registration on its own page; click "Next Registrant" until it stops asking."""
+def click_next_registrants(ctx, tab):
+    """DaySmart shows each pending registration on its own page; click "Next Registrant" until it stops asking."""
     clicks = 0
     for _ in range(40):
-        btn = find_button(tab, NEXT_REGISTRANT_RE)
+        btn = find_button(tab, NEXT_REGISTRANT_RE, timeout=15 if clicks == 0 else 8)
         if btn is None:
             break
-        btn.click()
+        before, pages_before = tab.inner_text("body"), list(ctx.pages)
+        moved = False
+        for attempt in range(4):  # if a click doesn't take, wait and try again
+            btn.click()
+            tab = newest_tab(ctx, tab, pages_before)
+            if wait_for_change(tab, before, timeout=6):
+                moved = True
+                break
+            btn = find_button(tab, NEXT_REGISTRANT_RE, timeout=5)
+            if btn is None:
+                break
+        if not moved:
+            log("  Clicked Next Registrant but the page didn't move on; stopping here.")
+            break
         clicks += 1
-        wait_settled(tab)
-    return clicks
+    return clicks, tab
 
 
 def open_checkout(ctx, page, cart_tab, keywords):
-    """After a round of adding, open the cart in its own tab and click through the Next Registrant pages."""
+    """After a round of adding, open the cart in its own tab and click through the registrant pages."""
     href = None
     for a in page.locator("a[href*='cart' i], a[href*='checkout' i]").all():
         try:
@@ -460,16 +498,23 @@ def open_checkout(ctx, page, cart_tab, keywords):
         cart_tab = ctx.new_page()
     load_page(cart_tab, url)
     cart_tab.bring_to_front()
-    select = find_button(cart_tab, SELECT_REGISTRANTS_RE)
+    select = find_button(cart_tab, SELECT_REGISTRANTS_RE, timeout=15)
     if select is not None:
+        before, pages_before = cart_tab.inner_text("body"), list(ctx.pages)
         select.click()
         log("  Clicked Select Registrants.")
-        wait_settled(cart_tab)
+        cart_tab = newest_tab(ctx, cart_tab, pages_before)
+        wait_for_change(cart_tab, before)
     else:
         log("  Didn't find a Select Registrants button on the cart page.")
-    clicks = click_next_registrants(cart_tab)
-    log(f"  Clicked Next Registrant {clicks} time(s)." if clicks else "  No Next Registrant pages to click through.")
-    shot(cart_tab, "cart")
+    clicks, cart_tab = click_next_registrants(ctx, cart_tab)
+    if clicks:
+        log(f"  Clicked Next Registrant {clicks} time(s).")
+    else:
+        log("  No Next Registrant button showed up.")
+        dump("registrants", cart_tab.content())
+    cart_tab.bring_to_front()
+    shot(cart_tab, "checkout")
     if has_all(cart_tab.inner_text("body"), keywords):
         log("  Confirmed: the slot shows up in your cart.")
     else:
