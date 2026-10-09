@@ -410,126 +410,36 @@ def scan_day(page, day, args, secured):
     return added
 
 
-PLACEHOLDER_RE = re.compile(r"^\s*$|select|choose|--|none|\b(add|new|create)\b", re.I)
-PICK_TRIGGER_RE = re.compile(r"(select|choose|assign|pick)\s+(an?\s+|the\s+)?(registrants?|participants?|attendees?|players?|members?)", re.I)
-DIALOG_OK_RE = re.compile(r"^\s*(save|done|apply|ok|confirm|select|continue|update)\b", re.I)
-
-# Radio/checkbox groups near the word "registrant" (or similar) where nothing is ticked yet: tick the first.
-PICK_BOXES_JS = """
-() => {
-  const skip = /insurance|waiver|agree|terms|policy|subscribe|newsletter|e-?mail|sms|text me|remember|donat|add-?on|\badd\b|coupon|promo/i;
-  const labelOf = inp => (inp.labels && inp.labels[0] ? inp.labels[0].innerText : inp.parentElement.innerText) || "";
-  const near = el => { for (let a = el, i = 0; a && i < 4; a = a.parentElement, i++)
-    if (/registrant|participant|attendee|player|who is/i.test(a.innerText || "")) return a; return null; };
-  const groups = new Map();
-  for (const inp of document.querySelectorAll("input[type=radio], input[type=checkbox]")) {
-    if (inp.disabled || skip.test(labelOf(inp))) continue;
-    const box = near(inp); if (!box) continue;
-    const key = inp.type === "radio" && inp.name ? "r:" + inp.name : box;
-    if (!groups.has(key)) groups.set(key, []);
-    groups.get(key).push(inp);
-  }
-  let n = 0;
-  for (const inputs of groups.values()) {
-    if (inputs.some(i => i.checked)) continue;
-    const first = inputs[0];
-    (first.labels && first.labels[0] ? first.labels[0] : first).click();
-    if (!first.checked) { first.checked = true; first.dispatchEvent(new Event("change", {bubbles: true})); }
-    n++;
-  }
-  return n;
-}
-"""
+NEXT_REGISTRANT_RE = re.compile(r"next\s+registrant", re.I)
 
 
-def close_dialog(tab):
-    dialog = tab.locator("[role='dialog']:visible, .modal.show, .v-dialog--active")
-    if not dialog.count():
-        return
-    for btn in dialog.last.get_by_role("button").all():
-        try:
-            if btn.is_visible() and btn.is_enabled() and DIALOG_OK_RE.search(btn.inner_text()):
-                btn.click()
-                tab.wait_for_timeout(800)
-                return
-        except Exception:
-            continue
-
-
-def select_registrants(tab):
-    """On the cart page, choose the first registrant for every item that doesn't have one yet."""
-    picked = 0
-    # 1. Ordinary dropdowns still showing a placeholder like "Select registrant"
-    for sel in tab.locator("select").all():
-        try:
-            if not (sel.is_visible() and sel.is_enabled()):
-                continue
-            current = sel.evaluate("s => s.selectedIndex >= 0 ? s.options[s.selectedIndex].text : ''")
-            if not PLACEHOLDER_RE.search(current):
-                continue
-            for opt in sel.locator("option").all():
-                value, text = opt.get_attribute("value"), opt.inner_text()
-                if value and not PLACEHOLDER_RE.search(text) and not opt.is_disabled():
-                    sel.select_option(value=value)
-                    log(f"  Registrant: picked {text.strip()!r}")
-                    picked += 1
-                    tab.wait_for_timeout(800)
-                    break
-        except Exception:
-            continue
-
-    # 2. Custom dropdowns / buttons like "Select Registrant" that open a list
-    for _ in range(20):
-        trigger = None
-        for el in tab.get_by_text(PICK_TRIGGER_RE).all():
+def click_next_registrants(tab):
+    """DaySmart asks about each registration on its own page; click "Next Registrant" until it stops asking."""
+    clicks = 0
+    for _ in range(40):
+        btn = None
+        for el in tab.get_by_role("button", name=NEXT_REGISTRANT_RE).all() + \
+                tab.get_by_role("link", name=NEXT_REGISTRANT_RE).all():
             try:
-                if el.is_visible() and not el.get_attribute("data-sniper-tried"):
-                    trigger = el
+                if el.is_visible() and el.is_enabled():
+                    btn = el
                     break
             except Exception:
                 continue
-        if trigger is None:
+        if btn is None:
             break
-        trigger.evaluate("e => e.setAttribute('data-sniper-tried', '1')")
-        trigger.click()
-        tab.wait_for_timeout(800)
-        options = tab.locator("[role='option']:visible, [role='menuitem']:visible, "
-                              ".dropdown-menu.show a, .dropdown-menu.show li, [role='listbox'] li:visible, "
-                              "[role='dialog']:visible li, [role='dialog']:visible label")
-        choice = None
-        for opt in options.all():
-            try:
-                if opt.is_visible() and not PLACEHOLDER_RE.search(opt.inner_text()):
-                    choice = opt
-                    break
-            except Exception:
-                continue
-        if choice is None:
-            # Probably just a heading like "Select registrants below"; close anything it opened and move on
-            tab.keyboard.press("Escape")
-            continue
-        name = " ".join(choice.inner_text().split())
-        choice.click()
-        tab.wait_for_timeout(800)
-        close_dialog(tab)
-        log(f"  Registrant: picked {name!r}")
-        picked += 1
-
-    # 3. Radio buttons / checkboxes listing registrants
-    try:
-        n = tab.evaluate(PICK_BOXES_JS)
-        if n:
-            log(f"  Registrant: ticked the first person in {n} list(s)")
-            picked += n
-            tab.wait_for_timeout(800)
-            close_dialog(tab)
-    except Exception:
-        pass
-    return picked
+        btn.click()
+        clicks += 1
+        try:
+            tab.wait_for_load_state("networkidle", timeout=10000)
+        except PWTimeout:
+            pass
+        tab.wait_for_timeout(1000)
+    return clicks
 
 
 def open_checkout(ctx, page, cart_tab, keywords):
-    """Show the cart/checkout in its own tab so polling can keep going in the other one."""
+    """After a round of adding, open the cart in its own tab and click through the Next Registrant pages."""
     href = None
     for a in page.locator("a[href*='cart' i], a[href*='checkout' i]").all():
         try:
@@ -541,36 +451,16 @@ def open_checkout(ctx, page, cart_tab, keywords):
     url = urljoin(page.url, href) if href else CART_URL
     if cart_tab is None or cart_tab.is_closed():
         cart_tab = ctx.new_page()
-    cart_tab.goto(url, wait_until="domcontentloaded")
-    try:
-        cart_tab.wait_for_load_state("networkidle", timeout=10000)
-    except PWTimeout:
-        pass
-    cart_tab.wait_for_timeout(1000)
+    load_page(cart_tab, url)
+    cart_tab.bring_to_front()
+    clicks = click_next_registrants(cart_tab)
+    log(f"  Clicked Next Registrant {clicks} time(s)." if clicks else "  No Next Registrant pages to click through.")
+    shot(cart_tab, "cart")
     if has_all(cart_tab.inner_text("body"), keywords):
         log("  Confirmed: the slot shows up in your cart.")
     else:
         log("  WARNING: the cart page doesn't seem to list the slot. It may not have been added; check the browser.")
-    if not select_registrants(cart_tab):
-        log("  No registrant choices found on the cart page (maybe none were needed).")
-    shot(cart_tab, "cart")
-    dump("cart", cart_tab.content())
-    # Go straight to checkout if the cart has a button for it (this never pays)
-    btn = cart_tab.get_by_role("button", name=re.compile(r"check ?out", re.I))
-    if btn.count() == 0:
-        btn = cart_tab.get_by_role("link", name=re.compile(r"check ?out", re.I))
-    try:
-        if btn.count() and btn.first.is_enabled():
-            btn.first.click()
-            cart_tab.wait_for_timeout(1500)
-        elif btn.count():
-            log("  The Checkout button is still greyed out. Pick the registrant(s) yourself in the cart tab.")
-        else:
-            log("  Couldn't find a Checkout button on the cart page.")
-    except Exception:
-        pass
-    cart_tab.bring_to_front()
-    log(f"  Opened your cart/checkout in a new tab: {cart_tab.url}")
+    log(f"  Ready for you to click Checkout in the browser: {cart_tab.url}")
     return cart_tab
 
 
@@ -617,14 +507,20 @@ def cmd_run(args):
                 if new_days != days:
                     days = new_days
                     log(f"Dates: {', '.join(f'{d:%a %b %d}' for d in days)}")
+                added = 0
                 for day in days:
                     try:
-                        if scan_day(page, day, args, secured):
-                            cart_tab = open_checkout(ctx, page, cart_tab, args.keywords)
+                        added += scan_day(page, day, args, secured)
                     except PWTimeout:
                         log(f"{day}: page timed out, will retry")
                     except Exception as e:
                         log(f"{day}: error {e!r}")
+                if added:  # done adding for this round: now go through the registrant pages to the cart
+                    try:
+                        cart_tab = open_checkout(ctx, page, cart_tab, args.keywords)
+                    except Exception as e:
+                        log(f"Couldn't open the cart ({e!r}). Open it yourself in the browser.")
+                        cart_tab = cart_tab or page
                 if args.once:
                     break
                 if cart_tab is not None and not args.keep_going:
