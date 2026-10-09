@@ -40,6 +40,7 @@ python sniper.py run --dry-run --once -v
 
 Options:
 - `--time 6am` only adds slots starting at that time.
+- `--exclude Goalie` never adds slots containing these words (comma separated; default Goalie).
 - `--days wed,fri` sets which weekdays to check (default Wednesday and Friday).
 - `--weeks 4` sets how far ahead to look; `--start`/`--end` pin exact dates instead.
 - `--interval 30` sets the seconds between polling rounds (a random 0–30% is added).

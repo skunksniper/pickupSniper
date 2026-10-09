@@ -159,7 +159,7 @@ def book_button(card):
     return None
 
 
-def finish_dialog(page, participant):
+def finish_dialog(page, participant, exclude=()):
     """Click through whatever comes after the first Register click until the item is in the cart."""
     for _ in range(5):
         page.wait_for_timeout(1200)
@@ -179,7 +179,10 @@ def finish_dialog(page, participant):
         scope = dialog.last if dialog.count() else page
         for btn in scope.get_by_role("button").all():
             try:
-                if btn.is_visible() and btn.is_enabled() and CONFIRM_RE.search(btn.inner_text()):
+                label = btn.inner_text()
+                if any(w.lower() in label.lower() for w in exclude):
+                    continue
+                if btn.is_visible() and btn.is_enabled() and CONFIRM_RE.search(label):
                     btn.click()
                     clicked = True
                     break
@@ -217,6 +220,11 @@ def scan_day(page, day, args, secured):
             dump(f"{day}-card", card.evaluate("e => e.outerHTML"))
         if key in secured:
             continue
+        blocked = [w for w in args.exclude if w.lower() in text.lower()]
+        if blocked:
+            if args.verbose:
+                log(f"  skipping, contains {blocked[0]!r}: {text[:100]}")
+            continue
         if args.time:
             begins = start_time(text, args.title)
             if begins != args.time:
@@ -238,7 +246,7 @@ def scan_day(page, day, args, secured):
             log("  dry run, not clicking")
             continue
         btn.click()
-        ok = finish_dialog(page, args.participant)
+        ok = finish_dialog(page, args.participant, args.exclude)
         path = shot(page, f"{day}-{'added' if ok else 'check'}")
         if not ok:
             dump(f"{day}-after-click", page.content())
@@ -362,6 +370,9 @@ def main():
     r.add_argument("--end", help="optional last date, YYYY-MM-DD (default: --weeks ahead)")
     r.add_argument("--days", default="wed,fri", help="weekdays to check (default: wed,fri)")
     r.add_argument("--title", default=DEFAULT_TITLE, help=f"event title to match (default: {DEFAULT_TITLE!r})")
+    r.add_argument("--exclude", default="Goalie",
+                   type=lambda v: [w.strip() for w in v.split(",") if w.strip()],
+                   help="never add slots containing any of these words, comma separated (default: Goalie)")
     r.add_argument("--participant", help="name to tick if the site asks who is registering")
     r.add_argument("--interval", type=float, default=30, help="seconds between rounds (default 30)")
     r.add_argument("--headless", action="store_true", help="hide the browser window (you can't check out from a hidden window)")
