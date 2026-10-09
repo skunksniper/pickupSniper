@@ -11,9 +11,11 @@ The script only ADDS TO CART. It never checks out or pays.
 import argparse
 import datetime as dt
 import json
+import queue
 import random
 import re
 import sys
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urljoin
@@ -84,9 +86,11 @@ def dump(name, html):
 
 
 def open_context(p, headless):
-    return p.chromium.launch_persistent_context(
+    ctx = p.chromium.launch_persistent_context(
         str(PROFILE_DIR), headless=headless, viewport={"width": 1280, "height": 1000}
     )
+    restore_auth(ctx)
+    return ctx
 
 
 TIME_RE = re.compile(r"\b(\d{1,2})(?::(\d{2}))?\s*([ap])\.?(?:m\.?)?(?![a-z])", re.I)
@@ -127,7 +131,7 @@ def has_all(text, keywords):
     return all(normalize(k) in flat for k in keywords)
 
 
-LOGIN_STATUS_FILE = HERE / ".login-status.json"
+AUTH_FILE = HERE / ".auth.json"  # saved cookies, including the ones a browser normally drops on close
 LOGGED_IN_RE = re.compile(r"\b(log ?out|sign ?out|my account)\b", re.I)
 LOGGED_OUT_RE = re.compile(r"^\s*(log ?in|sign ?in|login)\s*$", re.I)
 
@@ -150,15 +154,59 @@ def login_state(page):
     return "unknown"
 
 
-def save_login_state(state):
+def save_auth(ctx):
     try:
-        old = json.loads(LOGIN_STATUS_FILE.read_text()).get("state")
-    except (OSError, ValueError):
-        old = None
-    LOGIN_STATUS_FILE.write_text(json.dumps({"state": state, "checked": time.time()}))
-    if state != old:
-        log({"in": "Logged in to DaySmart.", "out": "NOT logged in to DaySmart.",
-             "unknown": "Couldn't tell whether you're logged in to DaySmart."}[state])
+        AUTH_FILE.write_text(json.dumps(ctx.storage_state()["cookies"]))
+        AUTH_FILE.chmod(0o600)
+    except Exception:
+        pass
+
+
+def restore_auth(ctx):
+    try:
+        ctx.add_cookies(json.loads(AUTH_FILE.read_text()))
+    except Exception:
+        pass
+
+
+_stdin_lines = queue.Queue()
+
+
+def wait_for_enter(timeout=None):
+    """True if Enter was pressed (or the control panel's button clicked) within timeout seconds."""
+    if not getattr(wait_for_enter, "started", False):
+        def reader():
+            for line in sys.stdin:
+                _stdin_lines.put(line)
+            _stdin_lines.put(None)
+        threading.Thread(target=reader, daemon=True).start()
+        wait_for_enter.started = True
+    try:
+        return _stdin_lines.get(timeout=timeout) is not None
+    except queue.Empty:
+        return False
+
+
+def ensure_logged_in(page, url):
+    """Make sure we're logged in, in THIS browser. If not, wait here until the user logs in."""
+    if login_state(page) == "in":
+        save_auth(page.context)
+        return
+    log("LOGIN NEEDED: log in to DaySmart in the browser window that just opened. "
+        "Watching starts by itself once you're logged in (or press Enter here if it doesn't notice).")
+    print("\a", end="", flush=True)
+    while True:
+        if wait_for_enter(timeout=3):
+            log("Continuing.")
+            break
+        try:
+            if login_state(page) == "in":
+                log("Logged in to DaySmart.")
+                break
+        except Exception:
+            pass  # page is mid-navigation while they log in
+    save_auth(page.context)
+    load_page(page, url)
 
 
 def load_page(page, url):
@@ -174,21 +222,8 @@ def cmd_login(_args):
     with sync_playwright() as p:
         ctx = open_context(p, headless=False)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        page.goto(f"{BASE_URL}?{QUERY}")
-        input("Log in to your DaySmart account in the browser window, then press Enter here... ")
         load_page(page, f"{BASE_URL}?{QUERY}")
-        save_login_state(login_state(page))
-        ctx.close()
-
-
-def cmd_check_login(_args):
-    with sync_playwright() as p:
-        ctx = open_context(p, headless=True)
-        page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        load_page(page, f"{BASE_URL}?{QUERY}")
-        state = login_state(page)
-        LOGIN_STATUS_FILE.unlink(missing_ok=True)  # always print the result
-        save_login_state(state)
+        ensure_logged_in(page, f"{BASE_URL}?{QUERY}")
         ctx.close()
 
 
@@ -301,18 +336,12 @@ def fmt_time(t):
 
 def scan_day(page, day, args, secured):
     url = f"{BASE_URL}?date={day.isoformat()}&{QUERY}"
-    page.goto(url, wait_until="domcontentloaded")
-    try:
-        page.wait_for_load_state("networkidle", timeout=15000)
-    except PWTimeout:
-        pass
-    page.wait_for_timeout(1000)
-
-    state = login_state(page)
-    save_login_state(state)
-    if state == "out":
-        log("You're logged out of DaySmart, so nothing can be added. Log in again, then restart.")
-        sys.exit(2)
+    load_page(page, url)
+    if login_state(page) == "out":
+        if args.headless:
+            log("You're logged out of DaySmart. Run without --headless so you can log in.")
+            sys.exit(2)
+        ensure_logged_in(page, url)
 
     cards, no_button = event_cards(page, args.keywords)
     added = 0
@@ -441,6 +470,14 @@ def cmd_run(args):
     with sync_playwright() as p:
         ctx = open_context(p, headless=args.headless)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        if not args.headless:
+            try:
+                load_page(page, f"{BASE_URL}?{QUERY}")
+                ensure_logged_in(page, f"{BASE_URL}?{QUERY}")
+            except KeyboardInterrupt:
+                log("stopped")
+                ctx.close()
+                return
         rounds = 0
         cart_tab = None
         try:
@@ -474,9 +511,11 @@ def cmd_run(args):
         finally:
             if cart_tab is not None and not args.headless:
                 print("\a", end="", flush=True)
+                print("Slots are in your cart. Finish checkout in the browser, then press Enter here to close it... ",
+                      flush=True)
                 try:
-                    input("Slots are in your cart. Finish checkout in the browser, then press Enter here to close it... ")
-                except (KeyboardInterrupt, EOFError):
+                    wait_for_enter()
+                except KeyboardInterrupt:
                     pass
             ctx.close()
 
@@ -484,8 +523,7 @@ def cmd_run(args):
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
-    sub.add_parser("login", help="open a browser so you can log in once")
-    sub.add_parser("check-login", help="check (without a window) whether the saved login still works")
+    sub.add_parser("login", help="open a browser and log in (run also asks you to log in when needed)")
     r = sub.add_parser("run", help="poll and add matching slots to the cart")
     r.add_argument("--weeks", type=int, default=4, help="how many weeks ahead to check (default 4)")
     r.add_argument("--time", type=parse_time, help="only add slots starting at this time, e.g. 6am or 6:00am")
@@ -506,7 +544,7 @@ def main():
     r.add_argument("--once", action="store_true", help="do a single round and exit")
     r.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
-    {"login": cmd_login, "check-login": cmd_check_login, "run": cmd_run}[args.cmd](args)
+    {"login": cmd_login, "run": cmd_run}[args.cmd](args)
 
 
 if __name__ == "__main__":

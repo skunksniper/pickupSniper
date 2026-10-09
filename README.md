@@ -11,8 +11,9 @@ If this folder is a git checkout, `app.py` pulls the latest version every time i
 python3 app.py
 ```
 
-It opens in your web browser. Click **Install** and **Open login window** once, then pick your
-days and start time and click **Start watching**. When slots land in your cart, a checkout tab
+It opens in your web browser. Click **Install** once, then pick your days and start time and click
+**Start watching**. A browser window opens; if you're not logged in to DaySmart it waits for you to
+log in there, then starts watching by itself. When slots land in your cart, a checkout tab
 opens. Finish paying there, then click **Done** in the panel.
 
 ## Command line
@@ -22,7 +23,7 @@ opens. Finish paying there, then click **Done** in the panel.
 ```bash
 pip install playwright
 python -m playwright install chromium
-python sniper.py login        # a browser opens: log in, then press Enter in the terminal
+python sniper.py login        # optional: `run` also asks you to log in when needed
 ```
 
 Your login is kept in `.browser-profile/` (git-ignored). Don't share that folder.

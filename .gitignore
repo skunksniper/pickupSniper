@@ -5,3 +5,4 @@ __pycache__/
 debug/
 .venv/
 .login-status.json
+.auth.json
