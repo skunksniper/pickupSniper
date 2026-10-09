@@ -10,7 +10,6 @@ The script only ADDS TO CART. It never checks out or pays.
 """
 import argparse
 import datetime as dt
-import json
 import random
 import re
 import sys
@@ -28,7 +27,7 @@ DEFAULT_KEYWORDS = "Drop-In Hockey"
 
 HERE = Path(__file__).resolve().parent
 PROFILE_DIR = HERE / ".browser-profile"
-STATE_FILE = HERE / "secured.json"
+OLD_STATE_FILE = HERE / "secured.json"  # no longer used; removed on startup
 SHOTS_DIR = HERE / "shots"
 DEBUG_DIR = HERE / "debug"
 
@@ -38,7 +37,7 @@ BOOK_RE = re.compile(r"^\s*(register|add to cart|book|sign up|select|reserve)\b"
 UNAVAILABLE_RE = re.compile(r"sold out|\bfull\b|wait ?list|not (yet )?available|registration (opens|closed)", re.I)
 # Buttons that move a follow-up dialog forward
 CONFIRM_RE = re.compile(r"^\s*(add to cart|add|continue|next|confirm|register|save)\b", re.I)
-SUCCESS_RE = re.compile(r"added to (your )?cart|item added|in your cart", re.I)
+SUCCESS_RE = re.compile(r"added to (your )?cart|item added|added to your order", re.I)
 
 
 def log(msg):
@@ -64,17 +63,6 @@ def parse_weekdays(text):
             sys.exit(f"--days: don't know {part!r}; use e.g. wed,fri")
         out.add(WEEKDAYS.index(part))
     return out
-
-
-def load_state():
-    try:
-        return set(json.loads(STATE_FILE.read_text()))
-    except (FileNotFoundError, ValueError):
-        return set()
-
-
-def save_state(secured):
-    STATE_FILE.write_text(json.dumps(sorted(secured), indent=2))
 
 
 def shot(page, name):
@@ -203,11 +191,21 @@ def book_button(card):
     return None
 
 
-def finish_dialog(page, participant, exclude=()):
-    """Click through whatever comes after the first Register click until the item is in the cart."""
+def finish_dialog(page, participant, exclude, before_text, before_url):
+    """Click through whatever comes after the first Register click until the item is in the cart.
+
+    Success means NEW "added to cart" text appeared, or we were taken to the cart page;
+    text that was already on the page before clicking doesn't count."""
+    baseline = len(SUCCESS_RE.findall(before_text))
+    was_cart = "cart" in before_url.lower()
+
+    def succeeded():
+        return len(SUCCESS_RE.findall(page.inner_text("body"))) > baseline or (
+            not was_cart and "cart" in page.url.lower())
+
     for _ in range(5):
         page.wait_for_timeout(1200)
-        if SUCCESS_RE.search(page.inner_text("body")):
+        if succeeded():
             return True
         if participant:
             who = page.get_by_text(participant, exact=False)
@@ -235,7 +233,7 @@ def finish_dialog(page, participant, exclude=()):
         if not clicked:
             break
     page.wait_for_timeout(1500)
-    return bool(SUCCESS_RE.search(page.inner_text("body"))) or "cart" in page.url.lower()
+    return succeeded()
 
 
 LAST_SUMMARY = {}
@@ -275,7 +273,7 @@ def scan_day(page, day, args, secured):
             log(f"    buttons/links: {buttons}")
             dump(f"{day}-card", card.evaluate("e => e.outerHTML"))
         if key in secured:
-            skip("already added", text)
+            skip("already added this session", text)
             continue
         blocked = [w for w in args.exclude if normalize(w) and normalize(w) in normalize(text)]
         if blocked:
@@ -298,8 +296,9 @@ def scan_day(page, day, args, secured):
         if args.dry_run:
             log("  dry run, not clicking")
             continue
+        before_text, before_url = page.inner_text("body"), page.url
         btn.click()
-        ok = finish_dialog(page, args.participant, args.exclude)
+        ok = finish_dialog(page, args.participant, args.exclude, before_text, before_url)
         path = shot(page, f"{day}-{'added' if ok else 'check'}")
         if not ok:
             dump(f"{day}-after-click", page.content())
@@ -307,7 +306,6 @@ def scan_day(page, day, args, secured):
             log(f"  ADDED TO CART. Go check out! (screenshot: {path})")
             print("\a", end="", flush=True)
             secured.add(key)
-            save_state(secured)
             added += 1
         else:
             log(f"  Clicked Register but couldn't confirm it's in the cart. Look at {path}")
@@ -325,7 +323,7 @@ def scan_day(page, day, args, secured):
     return added
 
 
-def open_checkout(ctx, page, cart_tab):
+def open_checkout(ctx, page, cart_tab, keywords):
     """Show the cart/checkout in its own tab so polling can keep going in the other one."""
     href = None
     for a in page.locator("a[href*='cart' i], a[href*='checkout' i]").all():
@@ -343,6 +341,11 @@ def open_checkout(ctx, page, cart_tab):
         cart_tab.wait_for_load_state("networkidle", timeout=10000)
     except PWTimeout:
         pass
+    cart_tab.wait_for_timeout(1000)
+    if has_all(cart_tab.inner_text("body"), keywords):
+        log("  Confirmed: the slot shows up in your cart.")
+    else:
+        log("  WARNING: the cart page doesn't seem to list the slot. It may not have been added; check the browser.")
     # Go straight to checkout if the cart has a button for it (this never pays)
     btn = cart_tab.get_by_role("button", name=re.compile(r"check ?out", re.I))
     if btn.count() == 0:
@@ -367,7 +370,8 @@ def upcoming_days(args, weekdays):
 
 def cmd_run(args):
     weekdays = parse_weekdays(args.days)
-    secured = load_state()
+    secured = set()  # slots added during this run, so we don't add the same one twice
+    OLD_STATE_FILE.unlink(missing_ok=True)
     days = upcoming_days(args, weekdays)
     if not days:
         sys.exit(f"No upcoming {args.days} dates to check")
@@ -394,7 +398,7 @@ def cmd_run(args):
                 for day in days:
                     try:
                         if scan_day(page, day, args, secured):
-                            cart_tab = open_checkout(ctx, page, cart_tab)
+                            cart_tab = open_checkout(ctx, page, cart_tab, args.keywords)
                     except PWTimeout:
                         log(f"{day}: page timed out, will retry")
                     except Exception as e:

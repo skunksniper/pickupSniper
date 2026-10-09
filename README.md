@@ -50,5 +50,5 @@ Options:
 - `--keywords "Drop-In Hockey"` sets the words a slot must contain (comma separated; capitals, spaces and dashes are ignored).
 - `--headless` hides the browser window.
 
-Slots already added are saved in `secured.json`, so they won't be added twice. Screenshots of each
+The script only remembers what it added during the current run, so a fresh start always looks again. Screenshots of each
 add attempt go to `shots/`. Stop it with Ctrl+C.
