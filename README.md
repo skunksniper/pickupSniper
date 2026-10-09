@@ -3,7 +3,19 @@
 Watches Sharks Ice (DaySmart) event registration for **"OIC - Drop-In Hockey"** slots and adds
 them to your cart the moment they open. It never checks out; you still pay yourself.
 
-## Setup (once)
+## Easiest: the control panel
+
+```bash
+python3 app.py
+```
+
+It opens in your web browser. Click **Install** and **Open login window** once, then pick your
+days and start time and click **Start watching**. When slots land in your cart, a checkout tab
+opens. Finish paying there, then click **Done** in the panel.
+
+## Command line
+
+### Setup (once)
 
 ```bash
 pip install playwright
@@ -13,7 +25,7 @@ python sniper.py login        # a browser opens: log in, then press Enter in the
 
 Your login is kept in `.browser-profile/` (git-ignored). Don't share that folder.
 
-## Run
+### Run
 
 ```bash
 # Upcoming Wednesdays and Fridays, 4 weeks ahead (the window rolls forward by itself):

@@ -303,7 +303,8 @@ def cmd_run(args):
     if not days:
         sys.exit(f"No upcoming {args.days} dates to check")
     log(f"Watching {args.days} for '{args.title}'"
-        + (f" starting at {args.time:%-I:%M %p}" if args.time else "")
+        + (f" starting at {args.time.hour % 12 or 12}:{args.time.minute:02d} {'AM' if args.time.hour < 12 else 'PM'}"
+           if args.time else "")
         + f", every ~{args.interval}s" + (" (DRY RUN)" if args.dry_run else ""))
     log(f"Dates: {', '.join(f'{d:%a %b %d}' for d in days)}")
 
