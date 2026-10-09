@@ -15,11 +15,13 @@ import re
 import sys
 import time
 from pathlib import Path
+from urllib.parse import urljoin
 
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
 
 BASE_URL = "https://apps.daysmartrecreation.com/dash/x/sharks/event-registration"
+CART_URL = "https://apps.daysmartrecreation.com/dash/x/sharks/cart"
 QUERY = "facility_ids=3&sport_ids=32&sport_ids=20&sport_ids=44"
 DEFAULT_TITLE = "OIC - Drop-In Hockey"
 
@@ -211,6 +213,38 @@ def scan_day(page, day, args, secured):
     return added
 
 
+def open_checkout(ctx, page, cart_tab):
+    """Show the cart/checkout in its own tab so polling can keep going in the other one."""
+    href = None
+    for a in page.locator("a[href*='cart' i], a[href*='checkout' i]").all():
+        try:
+            href = a.get_attribute("href")
+            if href:
+                break
+        except Exception:
+            continue
+    url = urljoin(page.url, href) if href else CART_URL
+    if cart_tab is None or cart_tab.is_closed():
+        cart_tab = ctx.new_page()
+    cart_tab.goto(url, wait_until="domcontentloaded")
+    try:
+        cart_tab.wait_for_load_state("networkidle", timeout=10000)
+    except PWTimeout:
+        pass
+    # Go straight to checkout if the cart has a button for it (this never pays)
+    btn = cart_tab.get_by_role("button", name=re.compile(r"check ?out", re.I))
+    if btn.count() == 0:
+        btn = cart_tab.get_by_role("link", name=re.compile(r"check ?out", re.I))
+    try:
+        if btn.count() and btn.first.is_enabled():
+            btn.first.click()
+    except Exception:
+        pass
+    cart_tab.bring_to_front()
+    log(f"  Opened your cart/checkout in a new tab: {cart_tab.url}")
+    return cart_tab
+
+
 def cmd_run(args):
     start = dt.date.fromisoformat(args.start)
     end = dt.date.fromisoformat(args.end)
@@ -225,12 +259,14 @@ def cmd_run(args):
         ctx = open_context(p, headless=args.headless)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         rounds = 0
+        cart_tab = None
         try:
             while True:
                 rounds += 1
                 for day in days:
                     try:
-                        scan_day(page, day, args, secured)
+                        if scan_day(page, day, args, secured):
+                            cart_tab = open_checkout(ctx, page, cart_tab)
                     except PWTimeout:
                         log(f"{day}: page timed out, will retry")
                     except Exception as e:
@@ -243,6 +279,12 @@ def cmd_run(args):
         except KeyboardInterrupt:
             log("stopped")
         finally:
+            if cart_tab is not None and not args.headless:
+                print("\a", end="", flush=True)
+                try:
+                    input("Slots are in your cart. Finish checkout in the browser, then press Enter here to close it... ")
+                except (KeyboardInterrupt, EOFError):
+                    pass
             ctx.close()
 
 
@@ -256,7 +298,7 @@ def main():
     r.add_argument("--title", default=DEFAULT_TITLE, help=f"event title to match (default: {DEFAULT_TITLE!r})")
     r.add_argument("--participant", help="name to tick if the site asks who is registering")
     r.add_argument("--interval", type=float, default=30, help="seconds between rounds (default 30)")
-    r.add_argument("--headless", action="store_true", help="hide the browser window")
+    r.add_argument("--headless", action="store_true", help="hide the browser window (you can't check out from a hidden window)")
     r.add_argument("--dry-run", action="store_true", help="report availability but don't click anything")
     r.add_argument("--once", action="store_true", help="do a single round and exit")
     r.add_argument("-v", "--verbose", action="store_true")
