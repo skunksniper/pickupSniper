@@ -121,8 +121,12 @@ def deps_ok():
         return False
 
 
-def logged_in():
-    return (HERE / ".browser-profile").exists()
+def login_status():
+    """What sniper.py last saw on the DaySmart page: {"state": "in"|"out"|"unknown", "checked": epoch} or None."""
+    try:
+        return json.loads((HERE / ".login-status.json").read_text())
+    except (OSError, ValueError):
+        return None
 
 
 def run_command(opts):
@@ -184,7 +188,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path.startswith("/status"):
             since = int(self.path.partition("since=")[2] or 0)
-            self._json(dict(runner.status(since), deps=deps_ok(), logged_in=logged_in()))
+            self._json(dict(runner.status(since), deps=deps_ok(), login=login_status()))
         else:
             self.send_error(404)
 
@@ -201,6 +205,8 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == "/setup":
                 ok = runner.start("setup", [sys.executable, "-c", SETUP_SCRIPT])
+            elif self.path == "/check-login":
+                ok = runner.start("check-login", [python(), str(SNIPER), "check-login"])
             elif self.path == "/login":
                 ok = runner.start("login", [python(), str(SNIPER), "login"])
             elif self.path == "/start":
@@ -252,6 +258,8 @@ pre{background:var(--log);color:var(--log-ink);border-radius:8px;padding:12px;he
 .step{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
 .step + .step{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
 .done{color:var(--ok);font-weight:600}
+.bad{color:var(--warn);font-weight:600}
+.unsure{color:var(--muted);font-weight:600}
 </style></head><body><main>
 <h1>Pickup Sniper</h1>
 <p class="sub">Watches Sharks Ice drop-in hockey and adds open slots to your cart. It never pays. You check out yourself.</p>
@@ -260,8 +268,8 @@ pre{background:var(--log);color:var(--log-ink);border-radius:8px;padding:12px;he
   <h2>First time setup</h2>
   <div class="step"><span>1. Install the browser helper <span id="depsDone" class="done"></span></span>
     <button id="setupBtn">Install</button></div>
-  <div class="step"><span>2. Log in to your DaySmart account <span id="loginDone" class="done"></span></span>
-    <button id="loginBtn">Open login window</button></div>
+  <div class="step"><span>2. Log in to your DaySmart account <span id="loginDone"></span></span>
+    <span class="row"><button id="checkBtn">Check</button><button id="loginBtn">Open login window</button></span></div>
 </section>
 
 <section>
@@ -327,23 +335,34 @@ async function post(path, body) {
 }
 $("setupBtn").onclick = () => post("/setup");
 $("loginBtn").onclick = () => post("/login");
+$("checkBtn").onclick = () => post("/check-login");
 $("startBtn").onclick = () => post("/start", read());
 $("stopBtn").onclick = () => post("/stop");
 $("enterBtn").onclick = () => post("/enter");
 
+function agoText(t) {
+  const m = Math.round((Date.now() / 1000 - t) / 60);
+  return m < 1 ? "just now" : m < 60 ? `${m} min ago` : m < 1440 ? `${Math.round(m / 60)} hr ago` : `${Math.round(m / 1440)} days ago`;
+}
 let since = 0;
 async function poll() {
   let s; try { s = await (await fetch("/status?since=" + since)).json(); } catch (e) { $("statusText").textContent = "Control panel closed"; return; }
   if (s.log) { const pre = $("log"); const atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
     pre.textContent += s.log; if (atEnd) pre.scrollTop = pre.scrollHeight; }
   since = s.size;
-  const names = {setup: "Installing…", login: "Login window open", run: "Watching for slots"};
+  const names = {setup: "Installing…", login: "Login window open", "check-login": "Checking login…", run: "Watching for slots"};
   $("dot").classList.toggle("on", s.running);
   $("statusText").textContent = s.running ? names[s.mode] : "Stopped";
-  ["setupBtn","loginBtn","startBtn"].forEach(b => $(b).disabled = s.running);
+  ["setupBtn","loginBtn","checkBtn","startBtn"].forEach(b => $(b).disabled = s.running);
   $("stopBtn").disabled = !s.running || s.mode !== "run";
   $("depsDone").textContent = s.deps ? "✓ done" : "";
-  $("loginDone").textContent = s.logged_in ? "✓ done" : "";
+  const L = s.login, ago = L ? agoText(L.checked) : "";
+  const [cls, txt] = s.mode === "check-login" ? ["unsure", "checking…"]
+    : !L ? ["unsure", "not checked yet"]
+    : L.state === "in" ? ["done", `✓ logged in (checked ${ago})`]
+    : L.state === "out" ? ["bad", `✗ not logged in (checked ${ago})`]
+    : ["unsure", `? couldn't tell (checked ${ago})`];
+  $("loginDone").className = cls; $("loginDone").textContent = txt;
   $("banner").classList.toggle("show", s.waiting);
   $("bannerText").textContent = s.mode === "login"
     ? "Log in using the browser window that opened, then click Done."
@@ -382,6 +401,8 @@ def self_update():
 def main():
     self_update()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    if deps_ok() and (HERE / ".browser-profile").exists():
+        runner.start("check-login", [python(), str(SNIPER), "check-login"])
     url = f"http://localhost:{PORT}"
     print(f"Pickup Sniper is running at {url}  (close this window to quit)")
     threading.Timer(0.5, webbrowser.open, args=(url,)).start()

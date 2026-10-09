@@ -4,3 +4,4 @@ shots/
 __pycache__/
 debug/
 .venv/
+.login-status.json

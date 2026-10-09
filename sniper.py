@@ -10,6 +10,7 @@ The script only ADDS TO CART. It never checks out or pays.
 """
 import argparse
 import datetime as dt
+import json
 import random
 import re
 import sys
@@ -126,14 +127,69 @@ def has_all(text, keywords):
     return all(normalize(k) in flat for k in keywords)
 
 
+LOGIN_STATUS_FILE = HERE / ".login-status.json"
+LOGGED_IN_RE = re.compile(r"\b(log ?out|sign ?out|my account)\b", re.I)
+LOGGED_OUT_RE = re.compile(r"^\s*(log ?in|sign ?in|login)\s*$", re.I)
+
+
+def login_state(page):
+    """'in', 'out' or 'unknown', judged from the site's own Log in / Log out links."""
+    if re.search(r"\b(log ?in|sign ?in)\b", page.url, re.I):
+        return "out"
+    labels = []
+    for el in page.locator("a, button").all():
+        try:
+            if el.is_visible():
+                labels.append(" ".join(el.inner_text().split()))
+        except Exception:
+            continue
+    if any(LOGGED_IN_RE.search(t) for t in labels):
+        return "in"
+    if any(LOGGED_OUT_RE.match(t) for t in labels):
+        return "out"
+    return "unknown"
+
+
+def save_login_state(state):
+    try:
+        old = json.loads(LOGIN_STATUS_FILE.read_text()).get("state")
+    except (OSError, ValueError):
+        old = None
+    LOGIN_STATUS_FILE.write_text(json.dumps({"state": state, "checked": time.time()}))
+    if state != old:
+        log({"in": "Logged in to DaySmart.", "out": "NOT logged in to DaySmart.",
+             "unknown": "Couldn't tell whether you're logged in to DaySmart."}[state])
+
+
+def load_page(page, url):
+    page.goto(url, wait_until="domcontentloaded")
+    try:
+        page.wait_for_load_state("networkidle", timeout=15000)
+    except PWTimeout:
+        pass
+    page.wait_for_timeout(1000)
+
+
 def cmd_login(_args):
     with sync_playwright() as p:
         ctx = open_context(p, headless=False)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
         page.goto(f"{BASE_URL}?{QUERY}")
         input("Log in to your DaySmart account in the browser window, then press Enter here... ")
+        load_page(page, f"{BASE_URL}?{QUERY}")
+        save_login_state(login_state(page))
         ctx.close()
-    log(f"Session saved to {PROFILE_DIR}")
+
+
+def cmd_check_login(_args):
+    with sync_playwright() as p:
+        ctx = open_context(p, headless=True)
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        load_page(page, f"{BASE_URL}?{QUERY}")
+        state = login_state(page)
+        LOGIN_STATUS_FILE.unlink(missing_ok=True)  # always print the result
+        save_login_state(state)
+        ctx.close()
 
 
 # Marks the smallest elements whose text contains every keyword (normally the event title line).
@@ -252,8 +308,10 @@ def scan_day(page, day, args, secured):
         pass
     page.wait_for_timeout(1000)
 
-    if re.search(r"\b(log ?in|sign ?in)\b", page.url, re.I):
-        log("Looks like you're logged out. Run `python sniper.py login` again.")
+    state = login_state(page)
+    save_login_state(state)
+    if state == "out":
+        log("You're logged out of DaySmart, so nothing can be added. Log in again, then restart.")
         sys.exit(2)
 
     cards, no_button = event_cards(page, args.keywords)
@@ -427,6 +485,7 @@ def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("login", help="open a browser so you can log in once")
+    sub.add_parser("check-login", help="check (without a window) whether the saved login still works")
     r = sub.add_parser("run", help="poll and add matching slots to the cart")
     r.add_argument("--weeks", type=int, default=4, help="how many weeks ahead to check (default 4)")
     r.add_argument("--time", type=parse_time, help="only add slots starting at this time, e.g. 6am or 6:00am")
@@ -447,7 +506,7 @@ def main():
     r.add_argument("--once", action="store_true", help="do a single round and exit")
     r.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
-    {"login": cmd_login, "run": cmd_run}[args.cmd](args)
+    {"login": cmd_login, "check-login": cmd_check_login, "run": cmd_run}[args.cmd](args)
 
 
 if __name__ == "__main__":
