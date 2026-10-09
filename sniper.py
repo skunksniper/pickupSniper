@@ -132,26 +132,44 @@ def has_all(text, keywords):
 
 
 AUTH_FILE = HERE / ".auth.json"  # saved cookies, including the ones a browser normally drops on close
-LOGGED_IN_RE = re.compile(r"\b(log ?out|sign ?out|my account)\b", re.I)
-LOGGED_OUT_RE = re.compile(r"^\s*(log ?in|sign ?in|login)\s*$", re.I)
+LOGGED_IN_RE = re.compile(r"\b(log ?out|sign ?out|log ?off|my account|my profile|logged in as)\b", re.I)
+LOGGED_OUT_RE = re.compile(r"\b(log ?in|sign ?in)\b", re.I)
 
 
-def login_state(page):
-    """'in', 'out' or 'unknown', judged from the site's own Log in / Log out links."""
-    if re.search(r"\b(log ?in|sign ?in)\b", page.url, re.I):
-        return "out"
-    labels = []
-    for el in page.locator("a, button").all():
+def page_labels(page):
+    """Text (or aria-label) of every visible link and button on the page."""
+    return page.evaluate("""() => [...document.querySelectorAll('a, button, [role=button]')]
+        .filter(e => e.offsetParent !== null || e.getClientRects().length)
+        .map(e => (e.innerText || e.getAttribute('aria-label') || e.title || '').replace(/\\s+/g, ' ').trim())
+        .filter(t => t)""")
+
+
+def login_state(page, settle=0.0, report=False):
+    """'in', 'out' or 'unknown'.
+
+    Logged out = the page offers a Log In / Sign In link. Logged in = it offers Log Out / My Account,
+    or (once the page has had `settle` seconds to finish drawing) there's simply no Log In link."""
+    deadline = time.time() + settle
+    while True:
         try:
-            if el.is_visible():
-                labels.append(" ".join(el.inner_text().split()))
+            labels = page_labels(page)
         except Exception:
-            continue
-    if any(LOGGED_IN_RE.search(t) for t in labels):
-        return "in"
-    if any(LOGGED_OUT_RE.match(t) for t in labels):
-        return "out"
-    return "unknown"
+            labels = []  # mid-navigation
+        short = [t for t in labels if len(t) <= 40]
+        if re.search(r"\b(log ?in|sign ?in)\b", page.url, re.I) or any(LOGGED_OUT_RE.search(t) for t in short):
+            state = "out"
+            break
+        if any(LOGGED_IN_RE.search(t) for t in short):
+            state = "in"
+            break
+        if time.time() >= deadline:
+            state = "in" if labels else "unknown"  # page has drawn its links and none of them is Log In
+            break
+        page.wait_for_timeout(500)
+    if report:
+        log(f"  Login check on {page.url}")
+        log(f"  Links/buttons seen: {', '.join(repr(t) for t in short[:30]) or '(none)'}")
+    return state
 
 
 def save_auth(ctx):
@@ -685,10 +703,10 @@ def cmd_session(_args):
                     break
                 elif cmd == "check":
                     pg = live_page()
-                    state = login_state(pg)
+                    state = login_state(pg, settle=3, report=True)
                     if state != "in":  # they may be on some other page; look at the event page itself
                         load_page(pg, f"{BASE_URL}?{QUERY}")
-                        state = login_state(pg)
+                        state = login_state(pg, settle=5, report=True)
                     if state == "in":
                         save_auth(ctx)
                     log({"in": "Logged in to DaySmart.",
