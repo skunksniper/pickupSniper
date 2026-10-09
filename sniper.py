@@ -273,6 +273,9 @@ def cmd_run(args):
                         log(f"{day}: error {e!r}")
                 if args.once:
                     break
+                if cart_tab is not None and not args.keep_going:
+                    log("Got slot(s) this round. Stopping so you can check out.")
+                    break
                 if rounds % 20 == 0:
                     log(f"still watching ({rounds} rounds, {len(secured)} added so far)")
                 time.sleep(args.interval + random.uniform(0, args.interval * 0.3))
@@ -300,6 +303,7 @@ def main():
     r.add_argument("--interval", type=float, default=30, help="seconds between rounds (default 30)")
     r.add_argument("--headless", action="store_true", help="hide the browser window (you can't check out from a hidden window)")
     r.add_argument("--dry-run", action="store_true", help="report availability but don't click anything")
+    r.add_argument("--keep-going", action="store_true", help="keep polling after adding slots instead of stopping")
     r.add_argument("--once", action="store_true", help="do a single round and exit")
     r.add_argument("-v", "--verbose", action="store_true")
     args = ap.parse_args()
