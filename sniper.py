@@ -44,11 +44,25 @@ def log(msg):
     print(f"[{dt.datetime.now():%H:%M:%S}] {msg}", flush=True)
 
 
-def daterange(start, end):
+WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
+
+
+def daterange(start, end, weekdays):
     d = start
     while d <= end:
-        yield d
+        if d.weekday() in weekdays:
+            yield d
         d += dt.timedelta(days=1)
+
+
+def parse_weekdays(text):
+    out = set()
+    for part in text.lower().split(","):
+        part = part.strip()[:3]
+        if part not in WEEKDAYS:
+            sys.exit(f"--days: don't know {part!r}; use e.g. wed,fri")
+        out.add(WEEKDAYS.index(part))
+    return out
 
 
 def load_state():
@@ -251,8 +265,10 @@ def cmd_run(args):
     if end < start:
         sys.exit("--end must be on or after --start")
     secured = load_state()
-    days = list(daterange(start, end))
-    log(f"Watching {len(days)} day(s) {start}..{end} for '{args.title}' every ~{args.interval}s"
+    days = list(daterange(start, end, parse_weekdays(args.days)))
+    if not days:
+        sys.exit(f"No {args.days} dates between {start} and {end}")
+    log(f"Watching {len(days)} day(s) ({', '.join(f'{d:%a %b %d}' for d in days)}) for '{args.title}' every ~{args.interval}s"
         + (" (DRY RUN)" if args.dry_run else ""))
 
     with sync_playwright() as p:
@@ -298,6 +314,7 @@ def main():
     r = sub.add_parser("run", help="poll and add matching slots to the cart")
     r.add_argument("--start", required=True, help="first date, YYYY-MM-DD")
     r.add_argument("--end", required=True, help="last date, YYYY-MM-DD")
+    r.add_argument("--days", default="wed,fri", help="weekdays to check (default: wed,fri)")
     r.add_argument("--title", default=DEFAULT_TITLE, help=f"event title to match (default: {DEFAULT_TITLE!r})")
     r.add_argument("--participant", help="name to tick if the site asks who is registering")
     r.add_argument("--interval", type=float, default=30, help="seconds between rounds (default 30)")
