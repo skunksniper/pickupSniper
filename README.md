@@ -5,6 +5,8 @@ them to your cart the moment they open. It never checks out; you still pay yours
 
 ## Easiest: the control panel
 
+If this folder is a git checkout, `app.py` pulls the latest version every time it starts.
+
 ```bash
 python3 app.py
 ```

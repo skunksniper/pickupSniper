@@ -355,7 +355,32 @@ setInterval(poll, 1000); poll();
 """
 
 
+def self_update():
+    """If this folder is a git checkout, pull the latest version, and restart if anything changed."""
+    if not (HERE / ".git").exists():
+        return
+
+    def git(*args):
+        return subprocess.run(["git", *args], cwd=HERE, capture_output=True, text=True, timeout=60)
+
+    try:
+        before = git("rev-parse", "HEAD").stdout.strip()
+        pull = git("pull", "--ff-only", "--quiet")
+        after = git("rev-parse", "HEAD").stdout.strip()
+    except (OSError, subprocess.TimeoutExpired) as e:
+        print(f"Couldn't check for updates ({e}); using the current version.")
+        return
+    if pull.returncode != 0:
+        print("Couldn't check for updates; using the current version.\n" + pull.stderr.strip())
+    elif before != after:
+        print("Updated to the latest version. Restarting...")
+        os.execv(sys.executable, [sys.executable, *sys.argv])
+    else:
+        print("Already up to date.")
+
+
 def main():
+    self_update()
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
     url = f"http://localhost:{PORT}"
     print(f"Pickup Sniper is running at {url}  (close this window to quit)")
