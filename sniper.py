@@ -410,31 +410,38 @@ def scan_day(page, day, args, secured):
     return added
 
 
+SELECT_REGISTRANTS_RE = re.compile(r"select\s+registrants?", re.I)
 NEXT_REGISTRANT_RE = re.compile(r"next\s+registrant", re.I)
+
+
+def find_button(tab, name_re):
+    for el in tab.get_by_role("button", name=name_re).all() + tab.get_by_role("link", name=name_re).all():
+        try:
+            if el.is_visible() and el.is_enabled():
+                return el
+        except Exception:
+            continue
+    return None
+
+
+def wait_settled(tab):
+    try:
+        tab.wait_for_load_state("networkidle", timeout=10000)
+    except PWTimeout:
+        pass
+    tab.wait_for_timeout(1000)
 
 
 def click_next_registrants(tab):
     """DaySmart asks about each registration on its own page; click "Next Registrant" until it stops asking."""
     clicks = 0
     for _ in range(40):
-        btn = None
-        for el in tab.get_by_role("button", name=NEXT_REGISTRANT_RE).all() + \
-                tab.get_by_role("link", name=NEXT_REGISTRANT_RE).all():
-            try:
-                if el.is_visible() and el.is_enabled():
-                    btn = el
-                    break
-            except Exception:
-                continue
+        btn = find_button(tab, NEXT_REGISTRANT_RE)
         if btn is None:
             break
         btn.click()
         clicks += 1
-        try:
-            tab.wait_for_load_state("networkidle", timeout=10000)
-        except PWTimeout:
-            pass
-        tab.wait_for_timeout(1000)
+        wait_settled(tab)
     return clicks
 
 
@@ -453,6 +460,13 @@ def open_checkout(ctx, page, cart_tab, keywords):
         cart_tab = ctx.new_page()
     load_page(cart_tab, url)
     cart_tab.bring_to_front()
+    select = find_button(cart_tab, SELECT_REGISTRANTS_RE)
+    if select is not None:
+        select.click()
+        log("  Clicked Select Registrants.")
+        wait_settled(cart_tab)
+    else:
+        log("  Didn't find a Select Registrants button on the cart page.")
     clicks = click_next_registrants(cart_tab)
     log(f"  Clicked Next Registrant {clicks} time(s)." if clicks else "  No Next Registrant pages to click through.")
     shot(cart_tab, "cart")
@@ -460,7 +474,7 @@ def open_checkout(ctx, page, cart_tab, keywords):
         log("  Confirmed: the slot shows up in your cart.")
     else:
         log("  WARNING: the cart page doesn't seem to list the slot. It may not have been added; check the browser.")
-    log(f"  Ready for you to click Checkout in the browser: {cart_tab.url}")
+    log(f"  Ready for you to check out in the browser: {cart_tab.url}")
     return cart_tab
 
 
