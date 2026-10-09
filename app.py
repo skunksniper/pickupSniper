@@ -157,7 +157,7 @@ def run_args(opts):
     if not any(c.isalnum() for c in keywords):
         raise ValueError("Enter at least one keyword, like Drop-In Hockey.")
     cmd += ["--keywords", keywords]
-    for flag in ("dry_run", "keep_going", "once", "verbose"):
+    for flag in ("dry_run", "once", "verbose"):
         if opts.get(flag):
             cmd.append("--" + flag.replace("_", "-"))
     return cmd
@@ -313,7 +313,6 @@ pre{background:var(--log);color:var(--log-ink);border-radius:8px;padding:12px;he
   </div>
   <div class="row checks" style="margin-top:12px">
     <label><input type="checkbox" id="dry_run"> Test mode (don't add anything)</label>
-    <label><input type="checkbox" id="keep_going"> Keep going after adding slots</label>
     <label><input type="checkbox" id="verbose"> Detailed log</label>
   </div>
 </section>
@@ -338,7 +337,7 @@ for (let h = 5; h <= 22; h++) for (const m of [0, 15, 30, 45]) {
   const label = `${h % 12 || 12}:${String(m).padStart(2,"0")} ${h < 12 ? "AM" : "PM"}`;
   $("time").insertAdjacentHTML("beforeend", `<option value="${label.replace(" ","").toLowerCase()}">${label}</option>`);
 }
-const FIELDS = ["exclude", "time","weeks","interval","keywords","dry_run","keep_going","verbose"];
+const FIELDS = ["exclude", "time","weeks","interval","keywords","dry_run","verbose"];
 function read() {
   const o = {days: [...document.querySelectorAll("#days input:checked")].map(i => i.value)};
   for (const f of FIELDS) { const el = $(f); o[f] = el.type === "checkbox" ? el.checked : el.value; }
@@ -376,7 +375,8 @@ async function poll() {
   const S = s.session || {}, setup = s.running && s.mode === "setup";
   const loggedIn = S.login === "in" || S.login === "unknown";
   $("dot").classList.toggle("on", !!S.watching || setup);
-  $("statusText").textContent = setup ? "Installing…" : S.watching ? "Watching for slots" : "Not watching";
+  $("statusText").textContent = setup ? "Installing…" : S.watching ? "Watching for slots"
+    : S.checkout ? "Stopped: reached checkout" : "Not watching";
   $("depsDone").textContent = s.deps ? "✓ done" : "";
   $("setupBtn").disabled = s.running;
   $("openBtn").disabled = s.running;
