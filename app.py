@@ -136,8 +136,6 @@ def run_command(opts):
     if opts.get("time"):
         cmd += ["--time", str(opts["time"])]
     cmd += ["--exclude", str(opts.get("exclude", "")).strip()]
-    if opts.get("participant", "").strip():
-        cmd += ["--participant", opts["participant"].strip()]
     if opts.get("title", "").strip():
         cmd += ["--title", opts["title"].strip()]
     for flag in ("dry_run", "keep_going", "once", "verbose"):
@@ -274,10 +272,7 @@ pre{background:var(--log);color:var(--log-ink);border-radius:8px;padding:12px;he
     <label class="field">Check every (seconds)<input id="interval" type="number" min="5" value="30"></label>
   </div>
   <div class="row" style="margin-top:12px">
-    <label class="field">Your name (if the site asks who's playing)<input id="participant" type="text" placeholder="optional"></label>
     <label class="field">Event title<input id="title" type="text" value="OIC - Drop-In Hockey"></label>
-  </div>
-  <div class="row" style="margin-top:12px">
     <label class="field">Never add slots containing (comma separated)<input id="exclude" type="text" value="Goalie"></label>
   </div>
   <div class="row checks" style="margin-top:12px">
@@ -306,7 +301,7 @@ for (let h = 5; h <= 22; h++) for (const m of [0, 15, 30, 45]) {
   const label = `${h % 12 || 12}:${String(m).padStart(2,"0")} ${h < 12 ? "AM" : "PM"}`;
   $("time").insertAdjacentHTML("beforeend", `<option value="${label.replace(" ","").toLowerCase()}">${label}</option>`);
 }
-const FIELDS = ["exclude", "time","weeks","interval","participant","title","dry_run","keep_going","verbose"];
+const FIELDS = ["exclude", "time","weeks","interval","title","dry_run","keep_going","verbose"];
 function read() {
   const o = {days: [...document.querySelectorAll("#days input:checked")].map(i => i.value)};
   for (const f of FIELDS) { const el = $(f); o[f] = el.type === "checkbox" ? el.checked : el.value; }
