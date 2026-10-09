@@ -334,14 +334,15 @@ def fmt_time(t):
     return f"{t.hour % 12 or 12}:{t.minute:02d} {'AM' if t.hour < 12 else 'PM'}"
 
 
+class LoggedOut(Exception):
+    pass
+
+
 def scan_day(page, day, args, secured):
     url = f"{BASE_URL}?date={day.isoformat()}&{QUERY}"
     load_page(page, url)
     if login_state(page) == "out":
-        if args.headless:
-            log("You're logged out of DaySmart. Run without --headless so you can log in.")
-            sys.exit(2)
-        ensure_logged_in(page, url)
+        raise LoggedOut()
 
     cards, no_button = event_cards(page, args.keywords)
     added = 0
@@ -533,63 +534,83 @@ def upcoming_days(args, weekdays):
     return list(daterange(start, end, weekdays))
 
 
-def cmd_run(args):
+def watch(ctx, page, args, stop, on_logged_out):
+    """Poll until slots are added (or stop is set). Returns the cart tab if anything was added, else None.
+
+    on_logged_out(page) is called if DaySmart logs us out; return True to carry on, False to stop watching."""
     weekdays = parse_weekdays(args.days)
     secured = set()  # slots added during this run, so we don't add the same one twice
     OLD_STATE_FILE.unlink(missing_ok=True)
     days = upcoming_days(args, weekdays)
     if not days:
-        sys.exit(f"No upcoming {args.days} dates to check")
+        log(f"No upcoming {args.days} dates to check.")
+        return None
     log(f"Watching {args.days} for slots containing {' + '.join(args.keywords)}"
         + (f" starting at {fmt_time(args.time)}" if args.time else "")
         + f", every ~{args.interval}s" + (" (DRY RUN)" if args.dry_run else ""))
     log(f"Dates: {', '.join(f'{d:%a %b %d}' for d in days)}")
+    rounds = 0
+    cart_tab = None
+    while not stop.is_set():
+        rounds += 1
+        new_days = upcoming_days(args, weekdays)
+        if not new_days:
+            log("No dates left to check.")
+            break
+        if new_days != days:
+            days = new_days
+            log(f"Dates: {', '.join(f'{d:%a %b %d}' for d in days)}")
+        added = 0
+        for day in days:
+            if stop.is_set():
+                break
+            try:
+                added += scan_day(page, day, args, secured)
+            except LoggedOut:
+                if not on_logged_out(page):
+                    return cart_tab
+            except PWTimeout:
+                log(f"{day}: page timed out, will retry")
+            except Exception as e:
+                log(f"{day}: error {e!r}")
+        if added:  # done adding for this round: now go through the registrant pages to the cart
+            try:
+                cart_tab = open_checkout(ctx, page, cart_tab, args.keywords)
+            except Exception as e:
+                log(f"Couldn't open the cart ({e!r}). Open it yourself in the browser.")
+                cart_tab = cart_tab or page
+        if args.once:
+            break
+        if cart_tab is not None and not args.keep_going:
+            log("Got slot(s) this round. Stopping so you can check out.")
+            break
+        if rounds % 20 == 0:
+            log(f"still watching ({rounds} rounds, {len(secured)} added so far)")
+        stop.wait(args.interval + random.uniform(0, args.interval * 0.3))
+    return cart_tab
 
+
+def cmd_run(args):
+    """Command-line use: one browser, asks you to log in if needed, then watches."""
     with sync_playwright() as p:
         ctx = open_context(p, headless=args.headless)
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
-        if not args.headless:
-            try:
-                load_page(page, f"{BASE_URL}?{QUERY}")
-                ensure_logged_in(page, f"{BASE_URL}?{QUERY}")
-            except KeyboardInterrupt:
-                log("stopped")
-                ctx.close()
-                return
-        rounds = 0
         cart_tab = None
         try:
-            while True:
-                rounds += 1
-                new_days = upcoming_days(args, weekdays)
-                if not new_days:
-                    log("No dates left to check.")
-                    break
-                if new_days != days:
-                    days = new_days
-                    log(f"Dates: {', '.join(f'{d:%a %b %d}' for d in days)}")
-                added = 0
-                for day in days:
-                    try:
-                        added += scan_day(page, day, args, secured)
-                    except PWTimeout:
-                        log(f"{day}: page timed out, will retry")
-                    except Exception as e:
-                        log(f"{day}: error {e!r}")
-                if added:  # done adding for this round: now go through the registrant pages to the cart
-                    try:
-                        cart_tab = open_checkout(ctx, page, cart_tab, args.keywords)
-                    except Exception as e:
-                        log(f"Couldn't open the cart ({e!r}). Open it yourself in the browser.")
-                        cart_tab = cart_tab or page
-                if args.once:
-                    break
-                if cart_tab is not None and not args.keep_going:
-                    log("Got slot(s) this round. Stopping so you can check out.")
-                    break
-                if rounds % 20 == 0:
-                    log(f"still watching ({rounds} rounds, {len(secured)} added so far)")
-                time.sleep(args.interval + random.uniform(0, args.interval * 0.3))
+            load_page(page, f"{BASE_URL}?{QUERY}")
+            if login_state(page) == "out":
+                if args.headless:
+                    sys.exit("You're logged out of DaySmart. Run without --headless so you can log in.")
+                ensure_logged_in(page, f"{BASE_URL}?{QUERY}")
+
+            def relogin(pg):
+                if args.headless:
+                    log("You're logged out of DaySmart. Run without --headless so you can log in.")
+                    return False
+                ensure_logged_in(pg, pg.url)
+                return True
+
+            cart_tab = watch(ctx, page, args, threading.Event(), relogin)
         except KeyboardInterrupt:
             log("stopped")
         finally:
@@ -604,10 +625,113 @@ def cmd_run(args):
             ctx.close()
 
 
-def main():
+def marker(name, value=""):
+    """Status lines for the control panel (it hides them from the log)."""
+    print(f"@@{name} {value}".rstrip(), flush=True)
+
+
+def cmd_session(_args):
+    """For the control panel: keep ONE browser open and take commands (JSON lines) on stdin.
+
+    {"cmd": "check"}              check whether we're logged in to DaySmart
+    {"cmd": "start", "argv": []}  start watching with these `run` options
+    {"cmd": "stop"}               stop watching (browser stays open)
+    {"cmd": "quit"}               close the browser and exit
+    """
+    commands = queue.Queue()
+    stop = threading.Event()
+
+    def reader():
+        for line in sys.stdin:
+            try:
+                msg = json.loads(line)
+            except ValueError:
+                continue
+            if msg.get("cmd") in ("stop", "quit"):
+                stop.set()
+            commands.put(msg)
+        stop.set()
+        commands.put({"cmd": "quit"})
+    threading.Thread(target=reader, daemon=True).start()
+
+    with sync_playwright() as p:
+        ctx = open_context(p, headless=False)
+        closed = threading.Event()
+        ctx.on("close", lambda _: closed.set())
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        load_page(page, f"{BASE_URL}?{QUERY}")
+        log("Browser open. Log in to DaySmart there, then click \"I'm logged in\" in the control panel.")
+        marker("BROWSER", "open")
+
+        def live_page():
+            nonlocal page
+            if page.is_closed():
+                page = ctx.new_page()
+                load_page(page, f"{BASE_URL}?{QUERY}")
+            return page
+
+        def on_logged_out(_pg):
+            log("DaySmart logged you out. Log in again in the browser, confirm in the control panel, then start again.")
+            marker("LOGIN", "out")
+            return False
+
+        while not closed.is_set():
+            try:
+                msg = commands.get(timeout=1)
+            except queue.Empty:
+                continue
+            cmd = msg.get("cmd")
+            try:
+                if cmd == "quit":
+                    break
+                elif cmd == "check":
+                    pg = live_page()
+                    state = login_state(pg)
+                    if state != "in":  # they may be on some other page; look at the event page itself
+                        load_page(pg, f"{BASE_URL}?{QUERY}")
+                        state = login_state(pg)
+                    if state == "in":
+                        save_auth(ctx)
+                    log({"in": "Logged in to DaySmart.",
+                         "out": "Not logged in yet: DaySmart still shows a Log In link.",
+                         "unknown": "Couldn't tell for sure whether you're logged in."}[state])
+                    marker("LOGIN", state)
+                elif cmd == "start":
+                    stop.clear()
+                    try:
+                        args = make_parser().parse_args(["run", *msg.get("argv", [])])
+                    except SystemExit:
+                        log("Bad settings; not starting.")
+                        continue
+                    marker("WATCHING", "on")
+                    cart_tab = watch(ctx, live_page(), args, stop, on_logged_out)
+                    if stop.is_set():
+                        log("Stopped watching. The browser stays open.")
+                    if cart_tab is not None:
+                        cart_tab.bring_to_front()
+                        print("\a", end="", flush=True)
+                        marker("CHECKOUT", "ready")
+                    marker("WATCHING", "off")
+                elif cmd == "stop":
+                    pass  # only matters while watching
+            except Exception as e:
+                if closed.is_set():
+                    break
+                log(f"Error: {e!r}")
+                marker("WATCHING", "off")
+        log("Browser closed.")
+        marker("BROWSER", "closed")
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
+
+def make_parser():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
     sub.add_parser("login", help="open a browser and log in (run also asks you to log in when needed)")
+    sub.add_parser("session", help="used by the control panel: one browser, commands on stdin")
     r = sub.add_parser("run", help="poll and add matching slots to the cart")
     r.add_argument("--weeks", type=int, default=4, help="how many weeks ahead to check (default 4)")
     r.add_argument("--time", type=parse_time, help="only add slots starting at this time, e.g. 6am or 6:00am")
@@ -627,8 +751,12 @@ def main():
     r.add_argument("--keep-going", action="store_true", help="keep polling after adding slots instead of stopping")
     r.add_argument("--once", action="store_true", help="do a single round and exit")
     r.add_argument("-v", "--verbose", action="store_true")
-    args = ap.parse_args()
-    {"login": cmd_login, "run": cmd_run}[args.cmd](args)
+    return ap
+
+
+def main():
+    args = make_parser().parse_args()
+    {"login": cmd_login, "session": cmd_session, "run": cmd_run}[args.cmd](args)
 
 
 if __name__ == "__main__":

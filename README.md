@@ -11,10 +11,16 @@ If this folder is a git checkout, `app.py` pulls the latest version every time i
 python3 app.py
 ```
 
-It opens in your web browser. Click **Install** once, then pick your days and start time and click
-**Start watching**. A browser window opens; if you're not logged in to DaySmart it waits for you to
-log in there, then starts watching by itself. When slots land in your cart, a checkout tab
-opens. Finish paying there, then click **Done** in the panel.
+It opens in your web browser. Then:
+
+1. **Install** (first time only).
+2. **Open browser**, log in to DaySmart in the window that opens, then click **I'm logged in** in the panel.
+3. Pick your days, start time and keywords.
+4. **Start watching.** Everything happens in that one browser window, so your login carries over.
+   **Stop** pauses watching without closing the browser.
+
+When slots land in your cart, it clicks through Select Registrants / Next Registrant and leaves you
+on checkout in that same window.
 
 ## Command line
 

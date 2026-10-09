@@ -20,14 +20,17 @@ WEEKDAYS = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
 
 class Runner:
-    """Runs one child process at a time (setup, login or run) and collects its output."""
+    """Runs one child process at a time (setup, or the browser session) and collects its output.
+
+    The session is one long-lived browser: login, confirming it, and watching all happen in it,
+    driven by JSON commands on its stdin. It reports its state with "@@NAME value" lines."""
 
     def __init__(self):
         self.lock = threading.Lock()
         self.proc = None
         self.mode = None
         self.log = []
-        self.waiting = False
+        self.state = {}
 
     def running(self):
         return self.proc is not None and self.proc.poll() is None
@@ -37,7 +40,7 @@ class Runner:
             if self.running():
                 return False
             self.mode = mode
-            self.waiting = False
+            self.state = {"browser": False, "login": None, "watching": False, "checkout": False}
             self.log.append(f"\n=== {mode} ===\n")
             env = dict(os.environ, PYTHONUNBUFFERED="1", PYTHONIOENCODING="utf-8")
             kwargs = {}
@@ -51,46 +54,57 @@ class Runner:
             return True
 
     def _pump(self, proc):
-        while True:
-            chunk = proc.stdout.read1(4096) if hasattr(proc.stdout, "read1") else proc.stdout.read(1)
-            if not chunk:
-                break
-            text = chunk.decode("utf-8", "replace").replace("\a", "")
+        for raw in iter(proc.stdout.readline, b""):
+            line = raw.decode("utf-8", "replace").replace("\a", "")
             with self.lock:
-                self.log.append(text)
-                # What the sniper is waiting on the person for, if anything (latest line wins)
-                for line in text.splitlines():
-                    if "LOGIN NEEDED" in line:
-                        self.waiting = "login"
-                    elif "press Enter" in line:
-                        self.waiting = "checkout"
-                    elif "Logged in to DaySmart" in line or "Continuing." in line:
-                        self.waiting = False
+                if line.startswith("@@"):
+                    name, _, value = line[2:].strip().partition(" ")
+                    if name == "BROWSER":
+                        self.state["browser"] = value == "open"
+                    elif name == "LOGIN":
+                        self.state["login"] = value
+                    elif name == "WATCHING":
+                        self.state["watching"] = value == "on"
+                    elif name == "CHECKOUT":
+                        self.state["checkout"] = True
+                    continue
+                self.log.append(line)
                 del self.log[:-2000]
         proc.wait()
         with self.lock:
-            self.waiting = False
-            self.log.append(f"\n[finished: {self.mode}]\n")
+            self.state = {"browser": False, "login": None, "watching": False, "checkout": False}
+            self.log.append(f"[finished: {self.mode}]\n")
 
-    def enter(self):
+    def send(self, msg):
         with self.lock:
-            if self.running():
+            if not self.running() or self.mode != "session":
+                return False
+            try:
+                self.proc.stdin.write((json.dumps(msg) + "\n").encode())
+                self.proc.stdin.flush()
+            except OSError:
+                return False
+            if msg["cmd"] == "check":
+                self.state["login"] = "checking"
+            elif msg["cmd"] == "start":
+                self.state["watching"] = True
+                self.state["checkout"] = False
+            return True
+
+    def session_state(self):
+        with self.lock:
+            return dict(self.state) if self.running() and self.mode == "session" else {}
+
+    def shutdown(self):
+        if self.running():
+            if self.mode == "session":
+                self.send({"cmd": "quit"})
                 try:
-                    self.proc.stdin.write(b"\n")
-                    self.proc.stdin.flush()
-                except OSError:
+                    self.proc.wait(timeout=5)
+                    return
+                except subprocess.TimeoutExpired:
                     pass
-                self.waiting = False
-
-    def stop(self):
-        with self.lock:
-            if not self.running():
-                return
-            if os.name == "nt":
-                self.proc.terminate()
-            else:
-                # Like Ctrl+C: if slots are already in the cart, the browser stays open for checkout.
-                self.proc.send_signal(signal.SIGINT)
+            self.proc.terminate()
 
     def status(self, since):
         with self.lock:
@@ -98,7 +112,6 @@ class Runner:
             return {
                 "running": self.running(),
                 "mode": self.mode if self.running() else None,
-                "waiting": self.waiting,
                 "log": text[since:] if since <= len(text) else text,
                 "size": len(text),
             }
@@ -128,8 +141,9 @@ def deps_ok():
 
 
 
-def run_command(opts):
-    cmd = [python(), str(SNIPER), "run"]
+def run_args(opts):
+    """Panel settings -> `sniper.py run` options."""
+    cmd = []
     days = [d for d in opts.get("days", []) if d in WEEKDAYS]
     if not days:
         raise ValueError("Pick at least one day of the week.")
@@ -187,7 +201,7 @@ class Handler(BaseHTTPRequestHandler):
             self.wfile.write(body)
         elif self.path.startswith("/status"):
             since = int(self.path.partition("since=")[2] or 0)
-            self._json(dict(runner.status(since), deps=deps_ok()))
+            self._json(dict(runner.status(since), deps=deps_ok(), session=runner.session_state()))
         else:
             self.send_error(404)
 
@@ -204,19 +218,30 @@ class Handler(BaseHTTPRequestHandler):
         try:
             if self.path == "/setup":
                 ok = runner.start("setup", [sys.executable, "-c", SETUP_SCRIPT])
+            elif self.path == "/open":
+                ok = runner.start("session", [python(), str(SNIPER), "session"])
+                if not ok:
+                    raise ValueError("The browser is already open (or setup is still running).")
+            elif self.path == "/check":
+                ok = runner.send({"cmd": "check"})
+                if not ok:
+                    raise ValueError("Open the browser first.")
             elif self.path == "/start":
-                ok = runner.start("run", run_command(opts))
-            elif self.path == "/enter":
-                runner.enter()
-                ok = True
+                st = runner.session_state()
+                if not st.get("browser"):
+                    raise ValueError("Open the browser and log in first.")
+                if st.get("login") not in ("in", "unknown"):
+                    raise ValueError("Log in to DaySmart in the browser, then click \"I'm logged in\" first.")
+                ok = runner.send({"cmd": "start", "argv": run_args(opts)})
             elif self.path == "/stop":
-                runner.stop()
-                ok = True
+                ok = runner.send({"cmd": "stop"})
+            elif self.path == "/close":
+                ok = runner.send({"cmd": "quit"})
             else:
                 return self.send_error(404)
         except ValueError as e:
             return self._json({"ok": False, "error": str(e)}, 400)
-        self._json({"ok": ok, "error": None if ok else "Something is already running. Stop it first."})
+        self._json({"ok": ok, "error": None if ok else "Something is already running."})
 
 
 PAGE = r"""<!doctype html>
@@ -253,19 +278,28 @@ pre{background:var(--log);color:var(--log-ink);border-radius:8px;padding:12px;he
 .step{display:flex;justify-content:space-between;align-items:center;gap:12px;flex-wrap:wrap}
 .step + .step{margin-top:10px;padding-top:10px;border-top:1px solid var(--line)}
 .done{color:var(--ok);font-weight:600}
+.bad{color:var(--warn);font-weight:600}
+.unsure{color:var(--muted);font-weight:600}
 </style></head><body><main>
 <h1>Pickup Sniper</h1>
 <p class="sub">Watches Sharks Ice drop-in hockey and adds open slots to your cart. It never pays. You check out yourself.</p>
 
 <section>
-  <h2>First time setup</h2>
+  <h2>1. First time setup</h2>
   <div class="step"><span>Install the browser helper <span id="depsDone" class="done"></span></span>
     <button id="setupBtn">Install</button></div>
-  <p class="hint">No separate login step: when you start, a browser opens and asks you to log in to DaySmart if needed.</p>
 </section>
 
 <section>
-  <h2>What to look for</h2>
+  <h2>2. Log in</h2>
+  <div class="step"><span>Open the browser and log in to DaySmart there <span id="browserState" class="done"></span></span>
+    <span class="row"><button id="openBtn" class="primary">Open browser</button><button id="closeBtn">Close browser</button></span></div>
+  <div class="step"><span>Then come back here and confirm <span id="loginState"></span></span>
+    <button id="checkBtn">I'm logged in</button></div>
+</section>
+
+<section>
+  <h2>3. What to look for</h2>
   <div class="days" id="days"></div>
   <div class="row" style="margin-top:12px">
     <label class="field">Start time
@@ -285,12 +319,13 @@ pre{background:var(--log);color:var(--log-ink);border-radius:8px;padding:12px;he
 </section>
 
 <section>
-  <div class="banner" id="banner"><span id="bannerText"></span><button class="primary" id="enterBtn">Done</button></div>
+  <h2>4. Watch</h2>
+  <div class="banner" id="banner"><span>Slots are in your cart! Finish checkout in the browser window. Your cart lives there, not in your usual browser.</span></div>
   <div class="row" style="justify-content:space-between">
     <div class="status"><span class="dot" id="dot"></span><span id="statusText">Stopped</span></div>
     <div class="row"><button class="primary" id="startBtn">Start watching</button><button id="stopBtn">Stop</button></div>
   </div>
-  <p class="hint">Check out in the browser window this opens, not your usual browser. Your cart lives there.</p>
+  <p class="hint" id="startHint"></p>
 </section>
 
 <section><h2>Log</h2><pre id="log"></pre></section>
@@ -326,9 +361,11 @@ async function post(path, body) {
   poll();
 }
 $("setupBtn").onclick = () => post("/setup");
+$("openBtn").onclick = () => post("/open");
+$("closeBtn").onclick = () => post("/close");
+$("checkBtn").onclick = () => post("/check");
 $("startBtn").onclick = () => post("/start", read());
 $("stopBtn").onclick = () => post("/stop");
-$("enterBtn").onclick = () => post("/enter");
 
 let since = 0;
 async function poll() {
@@ -336,22 +373,29 @@ async function poll() {
   if (s.log) { const pre = $("log"); const atEnd = pre.scrollTop + pre.clientHeight >= pre.scrollHeight - 20;
     pre.textContent += s.log; if (atEnd) pre.scrollTop = pre.scrollHeight; }
   since = s.size;
-  const names = {setup: "Installing…", run: s.waiting === "login" ? "Waiting for you to log in" : "Watching for slots"};
-  $("dot").classList.toggle("on", s.running);
-  $("statusText").textContent = s.running ? names[s.mode] : "Stopped";
-  ["setupBtn","startBtn"].forEach(b => $(b).disabled = s.running);
-  $("stopBtn").disabled = !s.running || s.mode !== "run";
+  const S = s.session || {}, setup = s.running && s.mode === "setup";
+  const loggedIn = S.login === "in" || S.login === "unknown";
+  $("dot").classList.toggle("on", !!S.watching || setup);
+  $("statusText").textContent = setup ? "Installing…" : S.watching ? "Watching for slots" : "Not watching";
   $("depsDone").textContent = s.deps ? "✓ done" : "";
-  $("banner").classList.toggle("show", !!s.waiting);
-  if (s.waiting === "login") {
-    $("bannerText").textContent = "Log in to DaySmart in the browser window that opened. Watching starts by itself once you're logged in.";
-    $("enterBtn").textContent = "I'm logged in";
-  } else {
-    $("bannerText").textContent = "Slots are in your cart! Finish checkout in the browser window, then click Done to close it.";
-    $("enterBtn").textContent = "Done";
-  }
-  const flag = {login: "🔑 Log in to DaySmart", checkout: "🏒 Check out now!"}[s.waiting];
-  document.title = flag && !document.hasFocus() ? `${flag} – Pickup Sniper` : "Pickup Sniper";
+  $("setupBtn").disabled = s.running;
+  $("openBtn").disabled = s.running;
+  $("closeBtn").disabled = !S.browser || S.watching;
+  $("browserState").textContent = S.browser ? "✓ browser open" : "";
+  $("checkBtn").disabled = !S.browser || S.watching || S.login === "checking";
+  const [cls, txt] = !S.browser ? ["unsure", ""]
+    : S.login === "checking" ? ["unsure", "checking…"]
+    : S.login === "in" ? ["done", "✓ logged in"]
+    : S.login === "out" ? ["bad", "✗ not logged in yet: log in, then click again"]
+    : S.login === "unknown" ? ["unsure", "? couldn't confirm, but you can start if you are logged in"]
+    : ["unsure", ""];
+  $("loginState").className = cls; $("loginState").textContent = txt;
+  $("startBtn").disabled = !S.browser || !loggedIn || S.watching;
+  $("stopBtn").disabled = !S.watching;
+  $("startHint").textContent = !S.browser ? "Open the browser and log in first (step 2)."
+    : !loggedIn ? "Click \"I'm logged in\" in step 2 first." : "";
+  $("banner").classList.toggle("show", !!S.checkout && !S.watching);
+  document.title = S.checkout && !S.watching && !document.hasFocus() ? "🏒 Check out now! – Pickup Sniper" : "Pickup Sniper";
 }
 setInterval(poll, 1000); poll();
 </script></body></html>
@@ -393,7 +437,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
-        runner.stop()
+        runner.shutdown()
 
 
 if __name__ == "__main__":
