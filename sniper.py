@@ -24,7 +24,7 @@ from playwright.sync_api import sync_playwright
 BASE_URL = "https://apps.daysmartrecreation.com/dash/x/sharks/event-registration"
 CART_URL = "https://apps.daysmartrecreation.com/dash/x/sharks/cart"
 QUERY = "facility_ids=3&sport_ids=32&sport_ids=20&sport_ids=44"
-DEFAULT_TITLE = "OIC - Drop-In Hockey"
+DEFAULT_KEYWORDS = "Drop-In Hockey"
 
 HERE = Path(__file__).resolve().parent
 PROFILE_DIR = HERE / ".browser-profile"
@@ -115,11 +115,27 @@ def to_time(m):
     return dt.time(hour, int(m.group(2) or 0))
 
 
-def start_time(card_text, title):
-    """The first time printed on the card (after the title), i.e. when the slot starts."""
-    rest = card_text.split(title, 1)[-1]
-    m = TIME_RE.search(rest) or TIME_RE.search(card_text)
+def start_time(card_text):
+    """The first time printed on the card, i.e. when the slot starts."""
+    m = TIME_RE.search(card_text)
     return to_time(m) if m else None
+
+
+def normalize(text):
+    """Lowercase letters and digits only, so 'Drop-In', 'drop in' and 'DropIn' all compare equal."""
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
+def parse_keywords(text):
+    words = [w.strip() for w in text.split(",") if normalize(w)]
+    if not words:
+        raise argparse.ArgumentTypeError("give at least one keyword")
+    return words
+
+
+def has_all(text, keywords):
+    flat = normalize(text)
+    return all(normalize(k) in flat for k in keywords)
 
 
 def cmd_login(_args):
@@ -132,21 +148,49 @@ def cmd_login(_args):
     log(f"Session saved to {PROFILE_DIR}")
 
 
-def event_cards(page, title):
-    """Return (card_locator, card_text) for every card whose text contains the title."""
+# Marks the smallest elements whose text contains every keyword (normally the event title line).
+MARK_ANCHORS_JS = """
+(keywords) => {
+  const norm = t => (t || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+  const keys = keywords.map(norm);
+  const hit = el => { const t = norm(el.innerText); return keys.every(k => t.includes(k)); };
+  document.querySelectorAll("[data-sniper-anchor]").forEach(e => e.removeAttribute("data-sniper-anchor"));
+  let n = 0;
+  for (const el of document.body.querySelectorAll("*")) {
+    if (["SCRIPT", "STYLE", "NOSCRIPT"].includes(el.tagName) || !hit(el)) continue;
+    if ([...el.children].some(hit)) continue;  // a child matches too, so this isn't the smallest
+    el.setAttribute("data-sniper-anchor", String(n++));
+  }
+  return n;
+}
+"""
+
+
+def event_cards(page, keywords):
+    """Return ([(card_locator, card_text)], n_without_button) for event cards containing all the keywords."""
+    count = page.evaluate(MARK_ANCHORS_JS, keywords)
+    no_button = 0
     cards = []
     seen = set()
-    for el in page.get_by_text(title, exact=False).all():
+    for i in range(count):
+        el = page.locator(f"[data-sniper-anchor='{i}']")
         # Climb to the nearest ancestor that also contains a button/link: that's the event card.
         card = el.locator("xpath=ancestor-or-self::*[.//button or .//a[@role='button' or contains(@class,'btn')]][1]")
         if card.count() == 0:
+            no_button += 1
             continue
-        text = " ".join(card.first.inner_text().split())
+        card = card.first
+        text = " ".join(card.inner_text().split())
         if text in seen:
             continue
         seen.add(text)
-        cards.append((card.first, text))
-    return cards
+        # If the climb swallowed several events (more times than one start/end per title), it's not one card.
+        anchors = card.locator("[data-sniper-anchor]").count() or 1
+        if len(TIME_RE.findall(text)) > 2 * anchors:
+            no_button += 1
+            continue
+        cards.append((card, text))
+    return cards, no_button
 
 
 def book_button(card):
@@ -194,6 +238,13 @@ def finish_dialog(page, participant, exclude=()):
     return bool(SUCCESS_RE.search(page.inner_text("body"))) or "cart" in page.url.lower()
 
 
+LAST_SUMMARY = {}
+
+
+def fmt_time(t):
+    return f"{t.hour % 12 or 12}:{t.minute:02d} {'AM' if t.hour < 12 else 'PM'}"
+
+
 def scan_day(page, day, args, secured):
     url = f"{BASE_URL}?date={day.isoformat()}&{QUERY}"
     page.goto(url, wait_until="domcontentloaded")
@@ -207,10 +258,15 @@ def scan_day(page, day, args, secured):
         log("Looks like you're logged out. Run `python sniper.py login` again.")
         sys.exit(2)
 
-    cards = event_cards(page, args.title)
-    if args.verbose:
-        log(f"{day}: {len(cards)} matching card(s)")
+    cards, no_button = event_cards(page, args.keywords)
     added = 0
+    reasons = {"no Register button yet": no_button} if no_button else {}
+
+    def skip(reason, text):
+        reasons[reason] = reasons.get(reason, 0) + 1
+        if args.verbose:
+            log(f"  skipping ({reason}): {text[:100]}")
+
     for card, text in cards:
         key = f"{day}|{text[:120]}"
         if args.verbose:
@@ -219,26 +275,23 @@ def scan_day(page, day, args, secured):
             log(f"    buttons/links: {buttons}")
             dump(f"{day}-card", card.evaluate("e => e.outerHTML"))
         if key in secured:
+            skip("already added", text)
             continue
-        blocked = [w for w in args.exclude if w.lower() in text.lower()]
+        blocked = [w for w in args.exclude if normalize(w) and normalize(w) in normalize(text)]
         if blocked:
-            if args.verbose:
-                log(f"  skipping, contains {blocked[0]!r}: {text[:100]}")
+            skip(f"contains {blocked[0]!r}", text)
             continue
         if args.time:
-            begins = start_time(text, args.title)
+            begins = start_time(text)
             if begins != args.time:
-                if args.verbose:
-                    log(f"  skipping, starts at {begins or 'unknown time'}: {text[:100]}")
+                skip(f"starts at {fmt_time(begins) if begins else 'unknown time'}", text)
                 continue
         if UNAVAILABLE_RE.search(text):
-            if args.verbose:
-                log(f"  unavailable: {text[:100]}")
+            skip("sold out / not open", text)
             continue
         btn = book_button(card)
         if not btn:
-            if args.verbose:
-                log(f"  no booking button yet: {text[:100]}")
+            skip("no Register button yet", text)
             continue
 
         log(f"AVAILABLE on {day}: {text[:120]}")
@@ -261,6 +314,14 @@ def scan_day(page, day, args, secured):
         # Reload the day so the remaining cards are fresh
         page.goto(url, wait_until="domcontentloaded")
         page.wait_for_timeout(1500)
+        page.evaluate(MARK_ANCHORS_JS, args.keywords)
+
+    summary = f"{day:%a %b %d}: {len(cards) + no_button} matching slot(s)"
+    if reasons:
+        summary += ", skipped " + ", ".join(f"{n} {r}" for r, n in reasons.items())
+    if args.verbose or summary != LAST_SUMMARY.get(day):
+        log(summary)
+    LAST_SUMMARY[day] = summary
     return added
 
 
@@ -310,9 +371,8 @@ def cmd_run(args):
     days = upcoming_days(args, weekdays)
     if not days:
         sys.exit(f"No upcoming {args.days} dates to check")
-    log(f"Watching {args.days} for '{args.title}'"
-        + (f" starting at {args.time.hour % 12 or 12}:{args.time.minute:02d} {'AM' if args.time.hour < 12 else 'PM'}"
-           if args.time else "")
+    log(f"Watching {args.days} for slots containing {' + '.join(args.keywords)}"
+        + (f" starting at {fmt_time(args.time)}" if args.time else "")
         + f", every ~{args.interval}s" + (" (DRY RUN)" if args.dry_run else ""))
     log(f"Dates: {', '.join(f'{d:%a %b %d}' for d in days)}")
 
@@ -369,7 +429,9 @@ def main():
     r.add_argument("--start", help="optional first date, YYYY-MM-DD (default: today)")
     r.add_argument("--end", help="optional last date, YYYY-MM-DD (default: --weeks ahead)")
     r.add_argument("--days", default="wed,fri", help="weekdays to check (default: wed,fri)")
-    r.add_argument("--title", default=DEFAULT_TITLE, help=f"event title to match (default: {DEFAULT_TITLE!r})")
+    r.add_argument("--keywords", "--title", dest="keywords", type=parse_keywords, default=parse_keywords(DEFAULT_KEYWORDS),
+                   help="words the slot must contain, comma separated; capitals, spaces and dashes don't matter"
+                        f" (default: {DEFAULT_KEYWORDS!r})")
     r.add_argument("--exclude", default="Goalie",
                    type=lambda v: [w.strip() for w in v.split(",") if w.strip()],
                    help="never add slots containing any of these words, comma separated (default: Goalie)")

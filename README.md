@@ -45,7 +45,7 @@ Options:
 - `--weeks 4` sets how far ahead to look; `--start`/`--end` pin exact dates instead.
 - `--interval 30` sets the seconds between polling rounds (a random 0–30% is added).
 - `--participant NAME` is the name to tick if the site asks who is registering.
-- `--title "..."` matches a different event title.
+- `--keywords "Drop-In Hockey"` sets the words a slot must contain (comma separated; capitals, spaces and dashes are ignored).
 - `--headless` hides the browser window.
 
 Slots already added are saved in `secured.json`, so they won't be added twice. Screenshots of each
