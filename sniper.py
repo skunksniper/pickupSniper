@@ -411,7 +411,9 @@ def scan_day(page, day, args, secured):
 
 
 SELECT_REGISTRANTS_RE = re.compile(r"select\s+registrants?", re.I)
-NEXT_REGISTRANT_RE = re.compile(r"next\s+registrant", re.I)
+# Each pending registration page has one of these; "Confirm Registration" shows up e.g. when the
+# person is already registered for that event.
+NEXT_REGISTRANT_RE = re.compile(r"next\s+registrant|confirm\s+registration", re.I)
 
 
 # Sites often grey a button out with aria-disabled or a "disabled" class instead of real disabling.
@@ -465,6 +467,7 @@ def click_next_registrants(ctx, tab):
         btn = find_button(tab, NEXT_REGISTRANT_RE, timeout=15 if clicks == 0 else 8)
         if btn is None:
             break
+        label = " ".join(btn.inner_text().split())
         before, pages_before = tab.inner_text("body"), list(ctx.pages)
         moved = False
         for attempt in range(4):  # if a click doesn't take, wait and try again
@@ -477,8 +480,9 @@ def click_next_registrants(ctx, tab):
             if btn is None:
                 break
         if not moved:
-            log("  Clicked Next Registrant but the page didn't move on; stopping here.")
+            log(f"  Clicked {label!r} but the page didn't move on; stopping here.")
             break
+        log(f"  Clicked {label!r}.")
         clicks += 1
     return clicks, tab
 
@@ -508,10 +512,8 @@ def open_checkout(ctx, page, cart_tab, keywords):
     else:
         log("  Didn't find a Select Registrants button on the cart page.")
     clicks, cart_tab = click_next_registrants(ctx, cart_tab)
-    if clicks:
-        log(f"  Clicked Next Registrant {clicks} time(s).")
-    else:
-        log("  No Next Registrant button showed up.")
+    if not clicks:
+        log("  No Next Registrant / Confirm Registration button showed up.")
         dump("registrants", cart_tab.content())
     cart_tab.bring_to_front()
     shot(cart_tab, "checkout")
