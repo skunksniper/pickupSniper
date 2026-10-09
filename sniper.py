@@ -27,6 +27,7 @@ HERE = Path(__file__).resolve().parent
 PROFILE_DIR = HERE / ".browser-profile"
 STATE_FILE = HERE / "secured.json"
 SHOTS_DIR = HERE / "shots"
+DEBUG_DIR = HERE / "debug"
 
 # Button text that means "I can book this"
 BOOK_RE = re.compile(r"^\s*(register|add to cart|book|sign up|select|reserve)\b", re.I)
@@ -66,6 +67,13 @@ def shot(page, name):
         page.screenshot(path=str(path), full_page=True)
     except Exception:
         pass
+    return path
+
+
+def dump(name, html):
+    DEBUG_DIR.mkdir(exist_ok=True)
+    path = DEBUG_DIR / f"{dt.datetime.now():%Y%m%d-%H%M%S}-{name}.html"
+    path.write_text(html)
     return path
 
 
@@ -163,6 +171,11 @@ def scan_day(page, day, args, secured):
     added = 0
     for card, text in cards:
         key = f"{day}|{text[:120]}"
+        if args.verbose:
+            buttons = [" ".join(b.inner_text().split()) for b in card.locator("button, a").all()]
+            log(f"  card: {text[:100]}")
+            log(f"    buttons/links: {buttons}")
+            dump(f"{day}-card", card.evaluate("e => e.outerHTML"))
         if key in secured:
             continue
         if UNAVAILABLE_RE.search(text):
@@ -182,6 +195,8 @@ def scan_day(page, day, args, secured):
         btn.click()
         ok = finish_dialog(page, args.participant)
         path = shot(page, f"{day}-{'added' if ok else 'check'}")
+        if not ok:
+            dump(f"{day}-after-click", page.content())
         if ok:
             log(f"  ADDED TO CART. Go check out! (screenshot: {path})")
             print("\a", end="", flush=True)
