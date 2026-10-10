@@ -4,6 +4,7 @@
 Uses only the Python standard library; it starts sniper.py for you and shows its output.
 """
 import json
+import re
 import os
 import signal
 import subprocess
@@ -149,7 +150,12 @@ def run_args(opts):
         raise ValueError("Pick at least one day of the week.")
     cmd += ["--days", ",".join(days)]
     cmd += ["--weeks", str(int(opts.get("weeks") or 4))]
-    cmd += ["--interval", str(max(5, float(opts.get("interval") or 30)))]
+    start = str(opts.get("start") or "").strip()
+    if start:
+        if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", start):
+            raise ValueError("Start date should look like 2026-10-14.")
+        cmd += ["--start", start]
+    cmd += ["--interval", str(max(3, float(opts.get("interval") or 10)))]
     if opts.get("time"):
         cmd += ["--time", str(opts["time"])]
     cmd += ["--exclude", str(opts.get("exclude", "")).strip()]
@@ -302,10 +308,15 @@ pre{background:var(--log);color:var(--log-ink);border-radius:8px;padding:12px;he
   <h2>3. What to look for</h2>
   <div class="days" id="days"></div>
   <div class="row" style="margin-top:12px">
+    <label class="field">Start with date (the next one to be released)<input id="start" type="date"></label>
+    <label class="field">Weeks ahead<input id="weeks" type="number" min="1" max="12" value="4"></label>
+  </div>
+  <p class="hint">It works through the dates in order: it sits on the first one, reloading only that page until its
+    slots are published, adds what's open, moves on, and goes to checkout once it reaches a date that isn't out yet.</p>
+  <div class="row" style="margin-top:12px">
     <label class="field">Start time
       <select id="time"><option value="">Any time</option></select></label>
-    <label class="field">Weeks ahead<input id="weeks" type="number" min="1" max="12" value="4"></label>
-    <label class="field">Check every (seconds)<input id="interval" type="number" min="5" value="30"></label>
+    <label class="field">Check every (seconds)<input id="interval" type="number" min="3" value="10"></label>
   </div>
   <div class="row" style="margin-top:12px">
     <label class="field">Slot must contain (comma separated)<input id="keywords" type="text" value="Drop-In Hockey"></label>
@@ -337,7 +348,7 @@ for (let h = 5; h <= 22; h++) for (const m of [0, 15, 30, 45]) {
   const label = `${h % 12 || 12}:${String(m).padStart(2,"0")} ${h < 12 ? "AM" : "PM"}`;
   $("time").insertAdjacentHTML("beforeend", `<option value="${label.replace(" ","").toLowerCase()}">${label}</option>`);
 }
-const FIELDS = ["exclude", "time","weeks","interval","keywords","dry_run","verbose"];
+const FIELDS = ["exclude", "start", "time","weeks","interval","keywords","dry_run","verbose"];
 function read() {
   const o = {days: [...document.querySelectorAll("#days input:checked")].map(i => i.value)};
   for (const f of FIELDS) { const el = $(f); o[f] = el.type === "checkbox" ? el.checked : el.value; }

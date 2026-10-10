@@ -426,7 +426,7 @@ def scan_day(page, day, args, secured):
     if args.verbose or summary != LAST_SUMMARY.get(day):
         log(summary)
     LAST_SUMMARY[day] = summary
-    return added
+    return added, len(cards) + no_button
 
 
 SELECT_REGISTRANTS_RE = re.compile(r"select\s+registrants?", re.I)
@@ -553,9 +553,12 @@ def upcoming_days(args, weekdays):
 
 
 def watch(ctx, page, args, stop, on_logged_out):
-    """Poll until slots are added (or stop is set). Returns the cart tab if anything was added, else None.
+    """Work through the dates IN ORDER. Sit on the current date, reloading just that page, until its
+    slots are published; add what's open; move straight on to the next date. As soon as we reach a
+    date that isn't published yet after adding something, go to checkout and stop.
 
-    on_logged_out(page) is called if DaySmart logs us out; return True to carry on, False to stop watching."""
+    Returns the cart tab if anything was added, else None. on_logged_out(page) is called if DaySmart
+    logs us out; return True to carry on, False to stop watching."""
     weekdays = parse_weekdays(args.days)
     secured = set()  # slots added during this run, so we don't add the same one twice
     OLD_STATE_FILE.unlink(missing_ok=True)
@@ -563,47 +566,53 @@ def watch(ctx, page, args, stop, on_logged_out):
     if not days:
         log(f"No upcoming {args.days} dates to check.")
         return None
-    log(f"Watching {args.days} for slots containing {' + '.join(args.keywords)}"
+    log(f"Looking for slots containing {' + '.join(args.keywords)}"
         + (f" starting at {fmt_time(args.time)}" if args.time else "")
-        + f", every ~{args.interval}s" + (" (DRY RUN)" if args.dry_run else ""))
-    log(f"Dates: {', '.join(f'{d:%a %b %d}' for d in days)}")
-    rounds = 0
+        + (" (DRY RUN)" if args.dry_run else ""))
+    log(f"Dates, in order: {', '.join(f'{d:%a %b %d}' for d in days)}")
     cart_tab = None
-    while not stop.is_set():
-        rounds += 1
-        new_days = upcoming_days(args, weekdays)
-        if not new_days:
-            log("No dates left to check.")
-            break
-        if new_days != days:
-            days = new_days
-            log(f"Dates: {', '.join(f'{d:%a %b %d}' for d in days)}")
-        added = 0
-        for day in days:
-            if stop.is_set():
-                break
-            try:
-                added += scan_day(page, day, args, secured)
-            except LoggedOut:
-                if not on_logged_out(page):
-                    return cart_tab
-            except PWTimeout:
-                log(f"{day}: page timed out, will retry")
-            except Exception as e:
-                log(f"{day}: error {e!r}")
-        if added:  # done adding for this round: go through the registrant pages to checkout, then stop
-            try:
-                cart_tab = open_checkout(ctx, page, cart_tab, args.keywords)
-            except Exception as e:
-                log(f"Couldn't open the cart ({e!r}). Open it yourself in the browser.")
-                cart_tab = cart_tab or page
-            log("Reached checkout. Stopped watching so you can pay.")
-            break
-        if args.once:
-            break
-        if rounds % 20 == 0:
-            log(f"still watching ({rounds} rounds, {len(secured)} added so far)")
-        stop.wait(args.interval + random.uniform(0, args.interval * 0.3))
+    total_added = 0
+    i = 0
+    waiting_on = None
+    checks = 0
+    while not stop.is_set() and i < len(days):
+        day = days[i]
+        try:
+            added, published = scan_day(page, day, args, secured)
+        except LoggedOut:
+            if not on_logged_out(page):
+                return cart_tab
+            continue
+        except PWTimeout:
+            log(f"{day}: page timed out, retrying")
+            continue
+        except Exception as e:
+            log(f"{day}: error {e!r}")
+            stop.wait(2)
+            continue
+        total_added += added
+        if published or args.once:
+            i += 1  # this date is out (whether or not anything could be added): next one, right away
+            waiting_on = None
+            continue
+        if total_added:
+            break  # got something, and the next date isn't out yet: don't hold the cart, go check out
+        if waiting_on != day:
+            waiting_on, checks = day, 0
+            log(f"Waiting for {day:%a %b %d} to be published; reloading it every ~{args.interval:g}s.")
+        checks += 1
+        if checks % 60 == 0:
+            log(f"Still waiting for {day:%a %b %d} ({checks} checks so far).")
+        stop.wait(args.interval + random.uniform(0, args.interval * 0.2))
+    if i >= len(days) and not total_added:
+        log("Went through every date; nothing to add.")
+    if total_added and not stop.is_set():
+        try:
+            cart_tab = open_checkout(ctx, page, cart_tab, args.keywords)
+        except Exception as e:
+            log(f"Couldn't open the cart ({e!r}). Open it yourself in the browser.")
+            cart_tab = page
+        log("Reached checkout. Stopped watching so you can pay.")
     return cart_tab
 
 
@@ -762,7 +771,7 @@ def make_parser():
                    type=lambda v: [w.strip() for w in v.split(",") if w.strip()],
                    help="never add slots containing any of these words, comma separated (default: Goalie)")
     r.add_argument("--participant", help="name to tick if the site asks who is registering")
-    r.add_argument("--interval", type=float, default=30, help="seconds between rounds (default 30)")
+    r.add_argument("--interval", type=float, default=10, help="seconds between reloads while waiting for a date (default 10)")
     r.add_argument("--headless", action="store_true", help="hide the browser window (you can't check out from a hidden window)")
     r.add_argument("--dry-run", action="store_true", help="report availability but don't click anything")
     r.add_argument("--once", action="store_true", help="do a single round and exit")
