@@ -263,10 +263,23 @@ MARK_ANCHORS_JS = """
 """
 
 
+# For a slot with no button: the text of its title's surroundings, without spilling into other slots.
+SLOT_TEXT_JS = """e => {
+  const times = t => (t.match(/\\b\\d{1,2}(:\\d{2})?\\s*[ap]\\.?m?\\b/gi) || []).length;
+  let best = e;
+  for (let a = e.parentElement, i = 0; a && i < 5; a = a.parentElement, i++) {
+    if (times(a.innerText || "") > 2) break;
+    best = a;
+  }
+  return best.innerText || "";
+}"""
+
+
 def event_cards(page, keywords):
-    """Return ([(card_locator, card_text)], n_without_button) for event cards containing all the keywords."""
+    """Return [(card_locator or None, card_text)] for event slots containing all the keywords.
+
+    The locator is None when the slot has no button of its own (e.g. sold out, or not bookable yet)."""
     count = page.evaluate(MARK_ANCHORS_JS, keywords)
-    no_button = 0
     cards = []
     seen = set()
     for i in range(count):
@@ -274,7 +287,7 @@ def event_cards(page, keywords):
         # Climb to the nearest ancestor that also contains a button/link: that's the event card.
         card = el.locator("xpath=ancestor-or-self::*[.//button or .//a[@role='button' or contains(@class,'btn')]][1]")
         if card.count() == 0:
-            no_button += 1
+            cards.append((None, " ".join(el.evaluate(SLOT_TEXT_JS).split())))
             continue
         card = card.first
         text = " ".join(card.inner_text().split())
@@ -284,10 +297,10 @@ def event_cards(page, keywords):
         # If the climb swallowed several events (more times than one start/end per title), it's not one card.
         anchors = card.locator("[data-sniper-anchor]").count() or 1
         if len(TIME_RE.findall(text)) > 2 * anchors:
-            no_button += 1
+            cards.append((None, " ".join(el.evaluate(SLOT_TEXT_JS).split())))
             continue
         cards.append((card, text))
-    return cards, no_button
+    return cards
 
 
 def book_button(card):
@@ -362,9 +375,10 @@ def scan_day(page, day, args, secured):
     if login_state(page) == "out":
         raise LoggedOut()
 
-    cards, no_button = event_cards(page, args.keywords)
+    cards = event_cards(page, args.keywords)
     added = 0
-    reasons = {"no Register button yet": no_button} if no_button else {}
+    wanted = 0  # slots that match every filter (keywords, exclusions, start time), bookable or not
+    reasons = {}
 
     def skip(reason, text):
         reasons[reason] = reasons.get(reason, 0) + 1
@@ -373,14 +387,11 @@ def scan_day(page, day, args, secured):
 
     for card, text in cards:
         key = f"{day}|{text[:120]}"
-        if args.verbose:
+        if args.verbose and card is not None:
             buttons = [" ".join(b.inner_text().split()) for b in card.locator("button, a").all()]
             log(f"  card: {text[:100]}")
             log(f"    buttons/links: {buttons}")
             dump(f"{day}-card", card.evaluate("e => e.outerHTML"))
-        if key in secured:
-            skip("already added this session", text)
-            continue
         blocked = [w for w in args.exclude if normalize(w) and normalize(w) in normalize(text)]
         if blocked:
             skip(f"contains {blocked[0]!r}", text)
@@ -390,6 +401,13 @@ def scan_day(page, day, args, secured):
             if begins != args.time:
                 skip(f"starts at {fmt_time(begins) if begins else 'unknown time'}", text)
                 continue
+        wanted += 1
+        if key in secured:
+            skip("already added this session", text)
+            continue
+        if card is None:
+            skip("sold out / not open" if UNAVAILABLE_RE.search(text) else "no Register button yet", text)
+            continue
         if UNAVAILABLE_RE.search(text):
             skip("sold out / not open", text)
             continue
@@ -420,13 +438,13 @@ def scan_day(page, day, args, secured):
         page.wait_for_timeout(1500)
         page.evaluate(MARK_ANCHORS_JS, args.keywords)
 
-    summary = f"{day:%a %b %d}: {len(cards) + no_button} matching slot(s)"
+    summary = f"{day:%a %b %d}: {len(cards)} slot(s) with the keywords, {wanted} matching all your filters"
     if reasons:
         summary += ", skipped " + ", ".join(f"{n} {r}" for r, n in reasons.items())
     if args.verbose or summary != LAST_SUMMARY.get(day):
         log(summary)
     LAST_SUMMARY[day] = summary
-    return added, len(cards) + no_button
+    return added, wanted
 
 
 SELECT_REGISTRANTS_RE = re.compile(r"select\s+registrants?", re.I)
@@ -592,6 +610,8 @@ def watch(ctx, page, args, stop, on_logged_out):
             continue
         total_added += added
         if published or args.once:
+            if published and not added:
+                log(f"{day:%a %b %d} is out, but nothing could be added (see above). Moving on.")
             i += 1  # this date is out (whether or not anything could be added): next one, right away
             waiting_on = None
             continue
