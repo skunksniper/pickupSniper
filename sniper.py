@@ -261,7 +261,7 @@ def load_page(page, url, cap=8.0):
             if size != last_size:
                 last_size, last_change = size, now
             busy = any(now - t < 3 for t in inflight.values())
-            if not busy and now - last_change >= 0.5 and size:
+            if not busy and now - last_change >= 0.8 and size:
                 break
     finally:
         page.remove_listener("request", on_request)
@@ -339,11 +339,41 @@ def event_cards(page, keywords):
     return cards
 
 
-def book_button(card):
+def excluded_word(text, exclude):
+    """The first exclusion word found in text (capitals, spaces and dashes ignored), else None."""
+    flat = normalize(text or "")
+    return next((w for w in exclude if normalize(w) and normalize(w) in flat), None)
+
+
+# What a slot shows about itself: its visible text plus labels on icons/images/buttons (title, aria-label,
+# alt). Hidden text (like a collapsed description) is left out on purpose: it may mention goalies in general.
+ALL_TEXT_JS = """e => {
+  const bits = [e.innerText || ""];
+  for (const el of [e, ...e.querySelectorAll("*")])
+    for (const a of ["title", "aria-label", "alt", "data-original-title", "placeholder", "value"])
+      if (el.getAttribute && el.getAttribute(a)) bits.push(el.getAttribute(a));
+  return bits.join(" ");
+}"""
+
+
+# Titles, headings, labels and option names in a popup: the short visible bits of text, not paragraphs
+# (a long description can mention goalies in general without this being a goalie slot).
+SHORT_LABELS_JS = """e => [e, ...e.querySelectorAll("*")]
+  .filter(el => el.offsetParent !== null || el === e)
+  .map(el => [...el.childNodes].filter(n => n.nodeType === 3).map(n => n.textContent).join(" ").trim()
+             + " " + ["title", "aria-label", "alt"].map(a => el.getAttribute && el.getAttribute(a) || "").join(" "))
+  .filter(t => t.trim() && t.trim().length <= 80)
+  .join(" | ")"""
+
+
+def book_button(card, exclude=()):
     for btn in card.locator("button, a[role='button'], a.btn, [class*='btn']").all():
         try:
-            if btn.is_visible() and btn.is_enabled() and BOOK_RE.search(btn.inner_text()):
-                return btn
+            if not (btn.is_visible() and btn.is_enabled() and BOOK_RE.search(btn.inner_text())):
+                continue
+            if exclude and excluded_word(btn.evaluate(ALL_TEXT_JS), exclude):
+                continue  # e.g. a separate "Register as Goalie" button
+            return btn
         except Exception:
             continue
     return None
@@ -366,6 +396,26 @@ def finish_dialog(page, participant, exclude, before_text, before_url):
     while time.time() < deadline:
         if succeeded():
             return True
+        # Never confirm something excluded: if the popup (or the page we were taken to) mentions it, back out.
+        dialog = page.locator("[role='dialog']:visible, .modal.show, .v-dialog--active")
+        try:
+            box = dialog.last if dialog.count() else (page.locator("body") if page.url != before_url else None)
+            where = box.evaluate(SHORT_LABELS_JS) if box is not None else ""
+        except Exception:
+            where = ""
+        word = excluded_word(where, exclude)
+        if word:
+            log(f"  The registration popup mentions {word!r}; NOT adding this one.")
+            try:
+                page.keyboard.press("Escape")
+                cancel = dialog.last.get_by_role("button", name=re.compile(r"cancel|close|no\b|back", re.I))
+                if dialog.count() and cancel.count():
+                    cancel.first.click()
+            except Exception:
+                pass
+            if page.url != before_url:
+                page.go_back()
+            return False
         if participant:
             for el in page.get_by_text(participant, exact=False).all():
                 try:
@@ -439,9 +489,10 @@ def scan_day(page, day, args, secured):
             log(f"  card: {text[:100]}")
             log(f"    buttons/links: {buttons}")
             dump(f"{day}-card", card.evaluate("e => e.outerHTML"))
-        blocked = [w for w in args.exclude if normalize(w) and normalize(w) in normalize(text)]
-        if blocked:
-            skip(f"contains {blocked[0]!r}", text)
+        word = excluded_word(text, args.exclude) or (
+            excluded_word(card.evaluate(ALL_TEXT_JS), args.exclude) if card is not None else None)
+        if word:
+            skip(f"contains {word!r}", text)
             continue
         if args.time:
             begins = start_time(text)
@@ -458,7 +509,7 @@ def scan_day(page, day, args, secured):
         if UNAVAILABLE_RE.search(text):
             skip("sold out / not open", text)
             continue
-        btn = book_button(card)
+        btn = book_button(card, args.exclude)
         if not btn:
             skip("no Register button yet", text)
             continue
@@ -472,12 +523,17 @@ def scan_day(page, day, args, secured):
         # Slots are found by position on the page, and the page can shift (e.g. after an add). Re-find THIS
         # slot by its exact text right before clicking, so we never click a different one (like a Goalie slot).
         card = next((c for c, t in event_cards(page, args.keywords) if c is not None and t == text), None)
-        btn = book_button(card) if card is not None else None
+        btn = book_button(card, args.exclude) if card is not None else None
         if btn is None:
             skip("changed on the page before it could be added", text)
             continue
+        page.wait_for_timeout(300)  # last look, in case the page was still filling in details
         card_now = " ".join(card.inner_text().split())
-        if card_now != text or any(normalize(w) and normalize(w) in normalize(card_now) for w in args.exclude):
+        word = excluded_word(card_now, args.exclude) or excluded_word(card.evaluate(ALL_TEXT_JS), args.exclude)
+        if word:
+            skip(f"contains {word!r}", text)
+            continue
+        if card_now != text:
             skip("changed on the page before it could be added", text)
             continue
         t0 = time.time()
@@ -559,7 +615,7 @@ def newest_tab(ctx, tab, pages_before):
     return tab
 
 
-def click_next_registrants(ctx, tab):
+def click_next_registrants(ctx, tab, exclude=()):
     """DaySmart shows each pending registration on its own page; click "Next Registrant" until it stops asking."""
     clicks = 0
     for _ in range(40):
@@ -573,6 +629,13 @@ def click_next_registrants(ctx, tab):
         if btn is None:
             break
         label = " ".join(btn.inner_text().split())
+        try:
+            word = excluded_word(tab.locator("body").evaluate(SHORT_LABELS_JS), exclude)
+        except Exception:
+            word = None
+        if word:
+            log(f"  WARNING: this registration page mentions {word!r}. If it's a {word} slot, remove it from "
+                f"your cart before paying.")
         before, pages_before = tab.inner_text("body"), list(ctx.pages)
         moved = False
         for attempt in range(4):  # if a click doesn't take, wait and try again
@@ -592,7 +655,7 @@ def click_next_registrants(ctx, tab):
     return clicks, tab
 
 
-def open_checkout(ctx, page, cart_tab, keywords):
+def open_checkout(ctx, page, cart_tab, keywords, exclude=()):
     """After a round of adding, open the cart in its own tab and click through the registrant pages."""
     href = None
     for a in page.locator("a[href*='cart' i], a[href*='checkout' i]").all():
@@ -616,7 +679,7 @@ def open_checkout(ctx, page, cart_tab, keywords):
         wait_for_change(cart_tab, before)
     else:
         log("  Didn't find a Select Registrants button on the cart page.")
-    clicks, cart_tab = click_next_registrants(ctx, cart_tab)
+    clicks, cart_tab = click_next_registrants(ctx, cart_tab, exclude)
     if not clicks:
         log("  No Next Registrant / Confirm Registration button showed up.")
         dump("registrants", cart_tab.content())
@@ -791,7 +854,7 @@ def _watch_dates(ctx, page, args, stop, on_logged_out, days, secured):
         log("Went through every date; nothing to add.")
     if total_added and not stop.is_set():
         try:
-            cart_tab = open_checkout(ctx, page, cart_tab, args.keywords)
+            cart_tab = open_checkout(ctx, page, cart_tab, args.keywords, args.exclude)
         except Exception as e:
             log(f"Couldn't open the cart ({e!r}). Open it yourself in the browser.")
             cart_tab = page
