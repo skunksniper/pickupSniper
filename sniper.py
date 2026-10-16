@@ -228,14 +228,45 @@ def ensure_logged_in(page, url):
     load_page(page, url)
 
 
-def load_page(page, url, settle=6000):
-    """Open url and wait until the page's data has loaded (network quiet), but no longer than settle ms."""
-    page.goto(url, wait_until="domcontentloaded")
+def load_page(page, url, cap=8.0):
+    """Open url and return as soon as its data has arrived and it has finished drawing.
+
+    "Done" = no data requests (xhr/fetch) still in flight and the page text unchanged for half a second.
+    Requests running longer than 3s are ignored, since some pages keep a background connection open
+    (which is why waiting for the network to go fully quiet could stall every page load). Never more
+    than cap seconds."""
+    inflight = {}
+
+    def on_request(req):
+        if req.resource_type in ("xhr", "fetch"):
+            inflight[req] = time.time()
+
+    def on_done(req):
+        inflight.pop(req, None)
+
+    page.on("request", on_request)
+    page.on("requestfinished", on_done)
+    page.on("requestfailed", on_done)
     try:
-        page.wait_for_load_state("networkidle", timeout=settle)
-    except PWTimeout:
-        pass
-    page.wait_for_timeout(250)
+        page.goto(url, wait_until="domcontentloaded")
+        start = last_change = time.time()
+        last_size = None
+        while time.time() - start < cap:
+            page.wait_for_timeout(100)
+            try:
+                size = page.evaluate("document.body ? document.body.innerText.length : 0")
+            except Exception:
+                size = None  # mid-navigation
+            now = time.time()
+            if size != last_size:
+                last_size, last_change = size, now
+            busy = any(now - t < 3 for t in inflight.values())
+            if not busy and now - last_change >= 0.5 and size:
+                break
+    finally:
+        page.remove_listener("request", on_request)
+        page.remove_listener("requestfinished", on_done)
+        page.remove_listener("requestfailed", on_done)
 
 
 def cmd_login(_args):
@@ -252,11 +283,14 @@ MARK_ANCHORS_JS = """
 (keywords) => {
   const norm = t => (t || "").toLowerCase().replace(/[^a-z0-9]/g, "");
   const keys = keywords.map(norm);
-  const hit = el => { const t = norm(el.innerText); return keys.every(k => t.includes(k)); };
+  // textContent is cheap; innerText (only visible text) is slow, so use it just to confirm
+  const has = t => { t = norm(t); return keys.every(k => t.includes(k)); };
+  const hit = el => has(el.textContent) && has(el.innerText);
   document.querySelectorAll("[data-sniper-anchor]").forEach(e => e.removeAttribute("data-sniper-anchor"));
   let n = 0;
+  if (!has(document.body.innerText)) return 0;  // nothing on the page at all: done
   for (const el of document.body.querySelectorAll("*")) {
-    if (["SCRIPT", "STYLE", "NOSCRIPT"].includes(el.tagName) || !hit(el)) continue;
+    if (["SCRIPT", "STYLE", "NOSCRIPT"].includes(el.tagName) || !has(el.textContent) || !hit(el)) continue;
     if ([...el.children].some(hit)) continue;  // a child matches too, so this isn't the smallest
     el.setAttribute("data-sniper-anchor", String(n++));
   }
