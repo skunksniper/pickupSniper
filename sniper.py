@@ -424,10 +424,12 @@ def finish_dialog(page, participant, exclude, before_text, before_url):
                         break
                 except Exception:
                     continue
+        # Only ever click a confirm button inside a popup, or on a NEW page the Register click took us to.
+        # Never on the event list itself: there, "Register" belongs to OTHER slots (this used to add Goalie slots).
         btn = None
-        dialog = page.locator("[role='dialog'], .modal.show, .modal-dialog, .v-dialog--active")
-        scope = dialog.last if dialog.count() else page
-        for b in scope.get_by_role("button").all():
+        dialog = page.locator("[role='dialog']:visible, .modal.show, .v-dialog--active")
+        scope = dialog.last if dialog.count() else (page if page.url != before_url else None)
+        for b in (scope.get_by_role("button").all() if scope is not None else []):
             try:
                 label = b.inner_text()
                 if any(w.lower() in label.lower() for w in exclude):
