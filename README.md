@@ -1,61 +1,68 @@
-# pickupSniper
+# Pickup Sniper
 
-Watches Sharks Ice (DaySmart) event registration for **"OIC - Drop-In Hockey"** slots and adds
-them to your cart the moment they open. It never checks out; you still pay yourself.
+Grabs Sharks Ice **Drop-In Hockey** slots the moment they're released and puts them in your cart.
+It never pays. You check out yourself.
 
-## Easiest: the control panel
+## First time on a computer
 
-If this folder is a git checkout, `app.py` pulls the latest version every time it starts.
+You need a Mac (or Windows PC) with Python 3. Open **Terminal** and paste these one line at a time:
 
-```bash
+```zsh
+cd ~
+git clone -b claude/confident-gates-hufqz6 https://github.com/skunksniper/pickupSniper.git
+cd pickupSniper
 python3 app.py
 ```
 
-It opens in your web browser. Then:
+If your Mac pops up asking to install "developer tools", click **Install**, wait, then run the lines again.
+On Windows, use `py app.py` instead of `python3 app.py`.
 
-1. **Install** (first time only).
-2. **Open browser**, log in to DaySmart in the window that opens, then click **I'm logged in** in the panel.
-3. Pick your days, start time and keywords.
-4. **Start watching.** Everything happens in that one browser window, so your login carries over.
-   **Stop** pauses watching without closing the browser.
+A control panel opens in your web browser. Click **Install** once (takes about a minute).
 
-When slots land in your cart, it clicks through Select Registrants / Next Registrant and leaves you
-on checkout in that same window.
+## Every time after that
 
-## Command line
-
-### Setup (once)
-
-```bash
-pip install playwright
-python -m playwright install chromium
-python sniper.py login        # optional: `run` also asks you to log in when needed
+```zsh
+cd ~/pickupSniper
+python3 app.py
 ```
 
-Your login is kept in `.browser-profile/` (git-ignored). Don't share that folder.
+It updates itself to the newest version each time it starts. Keep the Terminal window open while you use it.
 
-### Run
+## Using the panel
 
-```bash
-# Upcoming Wednesdays and Fridays, 4 weeks ahead (the window rolls forward by itself):
-python sniper.py run
+1. **Open browser.** A separate browser window opens on the DaySmart site. Log in there.
+2. **I'm logged in.** Click it back in the panel and wait for **✓ logged in**.
+3. **Choose what to grab:**
+   - **Days:** which weekdays (Wednesday and Friday are preselected).
+   - **Start with date:** the next date that's about to be released.
+   - **Start time:** for example 6:00 AM, or *Any time*.
+   - **Never add slots containing:** `Goalie` is already there, so goalie slots are always skipped.
+4. **Start watching.** It waits on your start date, reloading that page every few seconds until the slots
+   come out. Then it adds the open ones and moves straight on to the next date.
+5. **Check out.** When it has something, it clicks through Select Registrants and Next Registrant for you
+   and stops on the checkout page. The panel says **Stopped: reached checkout**. Pay in that same browser
+   window, not your usual browser, because that's where your cart is.
 
-# Only slots that start at 6:00 AM:
-python sniper.py run --time 6am
+**Stop** pauses watching without closing the browser. **Close browser** when you're done.
 
-# Try it without clicking anything:
-python sniper.py run --dry-run --once -v
+## Tips
+
+- Try **Test mode** first: it finds slots and shows them in the log but doesn't add anything.
+- Tick **Detailed log** to see why each slot was skipped.
+- If it says **not logged in**, log in again in the browser window, then click **I'm logged in**.
+- A yellow "already registered" page means you're signed up for that session already. Check the total
+  before paying so you don't pay twice.
+- Your login is saved in the `.browser-profile` folder. Don't share that folder with anyone.
+
+## Command line (optional)
+
+Everything the panel does also works from Terminal:
+
+```zsh
+python3 sniper.py run --start 2026-10-21 --time 6am         # watch from Oct 21, 6:00 AM slots only
+python3 sniper.py run --dry-run --once -v                   # look once without adding anything
+python3 sniper.py run --help                                # all options
 ```
 
-Options:
-- `--time 6am` only adds slots starting at that time.
-- `--exclude Goalie` never adds slots containing these words (comma separated; default Goalie).
-- `--days wed,fri` sets which weekdays to check (default Wednesday and Friday).
-- `--weeks 4` sets how far ahead to look; `--start`/`--end` pin exact dates instead.
-- `--interval 30` sets the seconds between polling rounds (a random 0–30% is added).
-- `--participant NAME` is the name to tick if the site asks who is registering.
-- `--keywords "Drop-In Hockey"` sets the words a slot must contain (comma separated; capitals, spaces and dashes are ignored).
-- `--headless` hides the browser window.
-
-The script only remembers what it added during the current run, so a fresh start always looks again. Screenshots of each
-add attempt go to `shots/`. Stop it with Ctrl+C.
+Useful options: `--days wed,fri`, `--time 6am`, `--exclude Goalie`, `--keywords "Drop-In Hockey"`,
+`--start YYYY-MM-DD`, `--weeks 4`, `--interval 10` (seconds between reloads).
