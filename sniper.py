@@ -469,11 +469,17 @@ def scan_day(page, day, args, secured):
             continue
         if need_reload:  # an earlier add on this page changed it; reload so this slot's button is fresh
             load_page(page, url)
-            page.evaluate(MARK_ANCHORS_JS, args.keywords)
-            btn = book_button(card)
-            if not btn:
-                skip("no Register button yet", text)
-                continue
+        # Slots are found by position on the page, and the page can shift (e.g. after an add). Re-find THIS
+        # slot by its exact text right before clicking, so we never click a different one (like a Goalie slot).
+        card = next((c for c, t in event_cards(page, args.keywords) if c is not None and t == text), None)
+        btn = book_button(card) if card is not None else None
+        if btn is None:
+            skip("changed on the page before it could be added", text)
+            continue
+        card_now = " ".join(card.inner_text().split())
+        if card_now != text or any(normalize(w) and normalize(w) in normalize(card_now) for w in args.exclude):
+            skip("changed on the page before it could be added", text)
+            continue
         t0 = time.time()
         before_text, before_url = page.inner_text("body"), page.url
         btn.click()
