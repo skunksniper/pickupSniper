@@ -423,6 +423,11 @@ def self_update():
 
     try:
         before = git("rev-parse", "HEAD").stdout.strip()
+        # Early installs followed a development branch; v1 lives on main, so move them over.
+        if git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip().startswith("claude/"):
+            if git("fetch", "--quiet", "origin", "main").returncode == 0:
+                if git("checkout", "--quiet", "-B", "main", "--track", "origin/main").returncode == 0:
+                    print("Switched to the main version.")
         pull = git("pull", "--ff-only", "--quiet")
         after = git("rev-parse", "HEAD").stdout.strip()
     except (OSError, subprocess.TimeoutExpired) as e:

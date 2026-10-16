@@ -9,7 +9,7 @@ You need a Mac (or Windows PC) with Python 3. Open **Terminal** and paste these 
 
 ```zsh
 cd ~
-git clone -b claude/confident-gates-hufqz6 https://github.com/skunksniper/pickupSniper.git
+git clone https://github.com/skunksniper/pickupSniper.git
 cd pickupSniper
 python3 app.py
 ```
