@@ -10,6 +10,7 @@ The script only ADDS TO CART. It never checks out or pays.
 """
 import argparse
 import datetime as dt
+import hashlib
 import json
 import queue
 import random
@@ -18,7 +19,7 @@ import sys
 import threading
 import time
 from pathlib import Path
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from playwright.sync_api import TimeoutError as PWTimeout
 from playwright.sync_api import sync_playwright
@@ -227,13 +228,14 @@ def ensure_logged_in(page, url):
     load_page(page, url)
 
 
-def load_page(page, url):
+def load_page(page, url, settle=6000):
+    """Open url and wait until the page's data has loaded (network quiet), but no longer than settle ms."""
     page.goto(url, wait_until="domcontentloaded")
     try:
-        page.wait_for_load_state("networkidle", timeout=15000)
+        page.wait_for_load_state("networkidle", timeout=settle)
     except PWTimeout:
         pass
-    page.wait_for_timeout(1000)
+    page.wait_for_timeout(250)
 
 
 def cmd_login(_args):
@@ -325,36 +327,46 @@ def finish_dialog(page, participant, exclude, before_text, before_url):
         return len(SUCCESS_RE.findall(page.inner_text("body"))) > baseline or (
             not was_cart and "cart" in page.url.lower())
 
-    for _ in range(5):
-        page.wait_for_timeout(1200)
+    deadline = time.time() + 12
+    clicks = 0
+    while time.time() < deadline:
         if succeeded():
             return True
         if participant:
-            who = page.get_by_text(participant, exact=False)
-            for el in who.all():
+            for el in page.get_by_text(participant, exact=False).all():
                 try:
                     if el.is_visible():
                         el.click()
                         break
                 except Exception:
                     continue
-        clicked = False
+        btn = None
         dialog = page.locator("[role='dialog'], .modal.show, .modal-dialog, .v-dialog--active")
         scope = dialog.last if dialog.count() else page
-        for btn in scope.get_by_role("button").all():
+        for b in scope.get_by_role("button").all():
             try:
-                label = btn.inner_text()
+                label = b.inner_text()
                 if any(w.lower() in label.lower() for w in exclude):
                     continue
-                if btn.is_visible() and btn.is_enabled() and CONFIRM_RE.search(label):
-                    btn.click()
-                    clicked = True
+                if b.is_visible() and b.is_enabled() and CONFIRM_RE.search(label):
+                    btn = b
                     break
             except Exception:
                 continue
-        if not clicked:
-            break
-    page.wait_for_timeout(1500)
+        if btn is not None and clicks < 5:
+            btn.click()
+            clicks += 1
+            # Before considering another click (no double adds), wait for success or for that button to go away
+            until = time.time() + 2.5
+            while time.time() < until and not succeeded():
+                try:
+                    if not btn.is_visible():
+                        break
+                except Exception:
+                    break
+                page.wait_for_timeout(100)
+            continue
+        page.wait_for_timeout(250)
     return succeeded()
 
 
@@ -385,6 +397,7 @@ def scan_day(page, day, args, secured):
         if args.verbose:
             log(f"  skipping ({reason}): {text[:100]}")
 
+    need_reload = False
     for card, text in cards:
         key = f"{day}|{text[:120]}"
         if args.verbose and card is not None:
@@ -420,6 +433,14 @@ def scan_day(page, day, args, secured):
         if args.dry_run:
             log("  dry run, not clicking")
             continue
+        if need_reload:  # an earlier add on this page changed it; reload so this slot's button is fresh
+            load_page(page, url)
+            page.evaluate(MARK_ANCHORS_JS, args.keywords)
+            btn = book_button(card)
+            if not btn:
+                skip("no Register button yet", text)
+                continue
+        t0 = time.time()
         before_text, before_url = page.inner_text("body"), page.url
         btn.click()
         ok = finish_dialog(page, args.participant, args.exclude, before_text, before_url)
@@ -427,16 +448,13 @@ def scan_day(page, day, args, secured):
         if not ok:
             dump(f"{day}-after-click", page.content())
         if ok:
-            log(f"  ADDED TO CART. Go check out! (screenshot: {path})")
+            log(f"  ADDED TO CART in {time.time() - t0:.1f}s. (screenshot: {path})")
             print("\a", end="", flush=True)
             secured.add(key)
             added += 1
         else:
             log(f"  Clicked Register but couldn't confirm it's in the cart. Look at {path}")
-        # Reload the day so the remaining cards are fresh
-        page.goto(url, wait_until="domcontentloaded")
-        page.wait_for_timeout(1500)
-        page.evaluate(MARK_ANCHORS_JS, args.keywords)
+        need_reload = True
 
     summary = f"{day:%a %b %d}: {len(cards)} slot(s) with the keywords, {wanted} matching all your filters"
     if reasons:
@@ -450,6 +468,7 @@ def scan_day(page, day, args, secured):
 SELECT_REGISTRANTS_RE = re.compile(r"select\s+registrants?", re.I)
 # Each pending registration page has one of these; "Confirm Registration" shows up e.g. when the
 # person is already registered for that event.
+CHECKOUT_PAGE_RE = re.compile(r"check\s*out|payment|order summary|place order|\btotal\b", re.I)
 NEXT_REGISTRANT_RE = re.compile(r"next\s+registrant|confirm\s+registration", re.I)
 
 
@@ -478,10 +497,13 @@ def wait_for_change(tab, before, timeout=15):
     """Wait until the page text differs from `before` (the click took us to the next page)."""
     deadline = time.time() + timeout
     while time.time() < deadline:
-        tab.wait_for_timeout(500)
+        tab.wait_for_timeout(200)
         try:
             if tab.inner_text("body") != before:
-                tab.wait_for_timeout(1000)  # let the rest of the new page render
+                try:  # let the rest of the new page render
+                    tab.wait_for_load_state("networkidle", timeout=3000)
+                except PWTimeout:
+                    pass
                 return True
         except Exception:
             pass  # mid-navigation
@@ -501,7 +523,13 @@ def click_next_registrants(ctx, tab):
     """DaySmart shows each pending registration on its own page; click "Next Registrant" until it stops asking."""
     clicks = 0
     for _ in range(40):
-        btn = find_button(tab, NEXT_REGISTRANT_RE, timeout=15 if clicks == 0 else 8)
+        if clicks == 0:
+            wait = 15
+        else:  # clearly on checkout now (no pending registrations left)? don't hang around waiting for a button
+            body = tab.inner_text("body")
+            done = CHECKOUT_PAGE_RE.search(body) and not re.search(r"pending\s+registration", body, re.I)
+            wait = 1.5 if done else 5
+        btn = find_button(tab, NEXT_REGISTRANT_RE, timeout=wait)
         if btn is None:
             break
         label = " ".join(btn.inner_text().split())
@@ -570,6 +598,71 @@ def upcoming_days(args, weekdays):
     return list(daterange(start, end, weekdays))
 
 
+class FastPoll:
+    """Cheap change detection while waiting for a date to be released.
+
+    Loading the events page fires a few small JSON requests that fetch the actual event data. Instead of
+    reloading the whole page, re-fetch just those (with the browser's own login cookies) and compare
+    them to before. When one changes, something was published, so it's worth a full page check.
+    If they can't be replayed, `usable` is False and the caller falls back to reloading the page."""
+
+    def __init__(self, page, url):
+        self.page = page
+        seen = {}
+
+        def on_response(resp):
+            try:
+                req = resp.request
+                if (req.method == "GET" and req.resource_type in ("xhr", "fetch") and resp.ok
+                        and "json" in resp.headers.get("content-type", "")):
+                    seen.setdefault(req.url, req.headers)
+            except Exception:
+                pass
+
+        page.on("response", on_response)
+        try:
+            load_page(page, url)
+        finally:
+            page.remove_listener("response", on_response)
+        # Only the site's own data requests, not analytics and the like
+        site = (urlparse(url).hostname or "").split(".")[-2:]
+        self.calls = [(u, {k: v for k, v in h.items() if k.lower() not in ("host", "content-length", "connection")})
+                      for u, h in seen.items()
+                      if (urlparse(u).hostname or "").split(".")[-2:] == site or "dash" in u or "daysmart" in u]
+        # Drop requests whose answer changes every time anyway (timestamps etc.): they'd cause false alarms
+        first, second = self._fetch_all(), self._fetch_all()
+        self.calls = [c for c, a, b in zip(self.calls, first, second) if a is not None and a == b]
+        self.baseline = self._fetch_all()
+        self.usable = bool(self.calls) and None not in self.baseline
+
+    def _fetch_all(self):
+        hashes = []
+        for u, headers in self.calls:
+            try:
+                resp = self.page.context.request.get(u, headers=headers, timeout=8000)
+                hashes.append(hashlib.sha1(resp.body()).hexdigest() if resp.ok else None)
+            except Exception:
+                hashes.append(None)
+        return hashes
+
+    def changed(self):
+        """True if the event data changed since last time, False if not, None if we can't tell anymore."""
+        now = self._fetch_all()
+        if None in now:
+            return None
+        if now != self.baseline:
+            self.baseline = now
+            return True
+        return False
+
+
+def block_heavy_files(route):
+    """While watching, skip images, video and fonts on the polling page: faster loads, same data."""
+    if route.request.resource_type in ("image", "media", "font"):
+        return route.abort()
+    return route.continue_()
+
+
 def watch(ctx, page, args, stop, on_logged_out):
     """Work through the dates IN ORDER. Sit on the current date, reloading just that page, until its
     slots are published; add what's open; move straight on to the next date. As soon as we reach a
@@ -588,10 +681,22 @@ def watch(ctx, page, args, stop, on_logged_out):
         + (f" starting at {fmt_time(args.time)}" if args.time else "")
         + (" (DRY RUN)" if args.dry_run else ""))
     log(f"Dates, in order: {', '.join(f'{d:%a %b %d}' for d in days)}")
+    page.route("**/*", block_heavy_files)
+    try:
+        return _watch_dates(ctx, page, args, stop, on_logged_out, days, secured)
+    finally:
+        try:
+            page.unroute("**/*", block_heavy_files)
+        except Exception:
+            pass
+
+
+def _watch_dates(ctx, page, args, stop, on_logged_out, days, secured):
     cart_tab = None
     total_added = 0
     i = 0
     waiting_on = None
+    fast = None
     checks = 0
     while not stop.is_set() and i < len(days):
         day = days[i]
@@ -619,11 +724,29 @@ def watch(ctx, page, args, stop, on_logged_out):
             break  # got something, and the next date isn't out yet: don't hold the cart, go check out
         if waiting_on != day:
             waiting_on, checks = day, 0
-            log(f"Waiting for {day:%a %b %d} to be published; reloading it every ~{args.interval:g}s.")
+            fast = FastPoll(page, f"{BASE_URL}?date={day.isoformat()}&{QUERY}")
+            if fast.usable:
+                log(f"Waiting for {day:%a %b %d} to be published. Quick-checking its event data every "
+                    f"~{args.interval:g}s ({len(fast.calls)} request(s)), with a full page check every minute.")
+            else:
+                log(f"Waiting for {day:%a %b %d} to be published; reloading the page every ~{max(args.interval, 5):g}s.")
         checks += 1
-        if checks % 60 == 0:
-            log(f"Still waiting for {day:%a %b %d} ({checks} checks so far).")
-        stop.wait(args.interval + random.uniform(0, args.interval * 0.2))
+        if checks % 20 == 0:
+            log(f"Still waiting for {day:%a %b %d}.")
+        if fast is not None and fast.usable:
+            full_check_at = time.time() + 60
+            while not stop.is_set() and time.time() < full_check_at:
+                stop.wait(args.interval + random.uniform(0, args.interval * 0.2))
+                result = fast.changed()
+                if result is None:
+                    log("Quick check stopped working; falling back to reloading the page.")
+                    fast.usable = False
+                    break
+                if result:
+                    log(f"{day:%a %b %d}: event data changed, checking the page now.")
+                    break
+        else:
+            stop.wait(max(args.interval, 5) + random.uniform(0, 1))
     if i >= len(days) and not total_added:
         log("Went through every date; nothing to add.")
     if total_added and not stop.is_set():
@@ -791,7 +914,8 @@ def make_parser():
                    type=lambda v: [w.strip() for w in v.split(",") if w.strip()],
                    help="never add slots containing any of these words, comma separated (default: Goalie)")
     r.add_argument("--participant", help="name to tick if the site asks who is registering")
-    r.add_argument("--interval", type=float, default=10, help="seconds between reloads while waiting for a date (default 10)")
+    r.add_argument("--interval", type=float, default=3,
+                   help="seconds between quick checks while waiting for a date (default 3; full page reloads are never faster than every 5s)")
     r.add_argument("--headless", action="store_true", help="hide the browser window (you can't check out from a hidden window)")
     r.add_argument("--dry-run", action="store_true", help="report availability but don't click anything")
     r.add_argument("--once", action="store_true", help="do a single round and exit")

@@ -37,8 +37,9 @@ It updates itself to the newest version each time it starts. Keep the Terminal w
    - **Start with date:** the next date that's about to be released.
    - **Start time:** for example 6:00 AM, or *Any time*.
    - **Never add slots containing:** `Goalie` is already there, so goalie slots are always skipped.
-4. **Start watching.** It waits on your start date, reloading that page every few seconds until the slots
-   come out. Then it adds the open ones and moves straight on to the next date.
+4. **Start watching.** It waits on your start date, quietly checking that date's event data every few
+   seconds (**Check every**, default 3) until the slots come out. Then it adds the open ones within a second
+   or two and moves straight on to the next date.
 5. **Check out.** When it has something, it clicks through Select Registrants and Next Registrant for you
    and stops on the checkout page. The panel says **Stopped: reached checkout**. Pay in that same browser
    window, not your usual browser, because that's where your cart is.
@@ -65,4 +66,4 @@ python3 sniper.py run --help                                # all options
 ```
 
 Useful options: `--days wed,fri`, `--time 6am`, `--exclude Goalie`, `--keywords "Drop-In Hockey"`,
-`--start YYYY-MM-DD`, `--weeks 4`, `--interval 10` (seconds between reloads).
+`--start YYYY-MM-DD`, `--weeks 4`, `--interval 3` (seconds between checks while waiting).
