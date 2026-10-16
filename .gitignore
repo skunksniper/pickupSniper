@@ -1,0 +1,8 @@
+.browser-profile/
+secured.json
+shots/
+__pycache__/
+debug/
+.venv/
+.login-status.json
+.auth.json
